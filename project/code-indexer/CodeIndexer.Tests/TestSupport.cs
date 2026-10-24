@@ -14,6 +14,7 @@ internal static class Fixtures
 
     public static string SimpleClassLib => Ensure("SimpleClassLib", "SimpleClassLib.sln");
     public static string MultiTarget => Ensure("MultiTarget", "MultiTarget.sln");
+    public static string Semantics => Ensure("Semantics", "Semantics.sln");
 
     private static string Ensure(string folder, string solution)
     {

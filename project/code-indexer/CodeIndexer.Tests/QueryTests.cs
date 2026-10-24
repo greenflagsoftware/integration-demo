@@ -218,14 +218,17 @@ public class QueryTests : IDisposable
     // ──────────────── Phase 3 tests ────────────────
 
     [Fact]
-    public void Refs_ExistingSymbol_ReturnsReferences()
+    public void Refs_KnownSymbol_ReturnsEnvelope()
     {
         using var queries = new SymbolQueries(_dbPath);
         var result = queries.Refs("ICalculator", 100);
 
+        // Envelope only: what refs should contain is asserted by SemanticsGoldenTests against the index.
         Assert.Equal("refs", result.Command);
-        // No in-project calls to ICalculator in the fixture, but endpoint should work.
-        Assert.NotNull(result.Data);
+        Assert.Equal("SimpleClassLib", result.SolutionName);
+        Assert.Equal(result.Data.Count, result.TotalCount);
+        Assert.False(result.Truncated);
+        Assert.Null(result.Warnings);
     }
 
     [Fact]
@@ -240,25 +243,27 @@ public class QueryTests : IDisposable
     }
 
     [Fact]
-    public void Callers_FindsExternalCallers()
+    public void Callers_OfSymbolWithNoCallers_IsEmptyEnvelope()
     {
         using var queries = new SymbolQueries(_dbPath);
-        // No method calls ICalculator in the fixture, so callers should be empty.
+        // Nothing in the fixture calls the ICalculator type itself.
         var result = queries.Callers("ICalculator", 1, 50);
 
         Assert.Equal("callers", result.Command);
-        Assert.NotNull(result.Data);
+        Assert.Empty(result.Data);
+        Assert.Null(result.Warnings);
     }
 
     [Fact]
-    public void Callees_NoCalleesForMethod()
+    public void Callees_OfMethodWithNoIndexedCallees_IsEmptyEnvelope()
     {
         using var queries = new SymbolQueries(_dbPath);
-        // Subtract only calls BCL methods which aren't indexed.
+        // Subtract calls nothing.
         var result = queries.Callees("global::SimpleLib.Calculator.Subtract", 1, 50);
 
         Assert.Equal("callees", result.Command);
-        Assert.NotNull(result.Data);
+        Assert.Empty(result.Data);
+        Assert.Null(result.Warnings);
     }
 
     [Fact]

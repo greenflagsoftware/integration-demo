@@ -181,20 +181,46 @@ Each phase ends with something usable and tested. Check items off as work comple
       The full partial-class model (one symbol, many locations) is still Phase C.
 - Fixture tests restore the fixture solutions on first use, since `obj\` is git-ignored.
 
-### Phase B: A fixture that can actually fail
-**Outcome:** tests that exercise the hard cases with real assertions (today's tests mostly assert
-`NotNull`).
-- [ ] Fixture solution `tests\Fixtures\Semantics\` covering: overloaded methods, generic types and generic
-      methods, extension methods, partial classes split across files (one generated), partial methods,
-      nested types, interface implementation (implicit and explicit), abstract/virtual/override chains,
-      records, structs, enums, delegates and events, properties, fields with initializers, constructor
-      chains (`this(...)`/`base(...)`), lambdas and local functions, object creation (including target-typed
-      `new()`), `nameof`/`typeof`/attributes, a multi-targeted project, and calls into external code
-      (`HttpClient`, `List<T>`, LINQ).
-- [ ] Golden expectations written by hand for: who calls each overload, who references each type, who
-      implements what, the call graph through an interface, and the symbol/location counts.
-- [ ] Tests assert exact results (counts, ids resolved by key, line numbers), not just non-null.
-- [ ] Tests for idempotent re-index, path normalization, and the filter semantics.
+### Phase B: A fixture that can actually fail (done 2026-10-24)
+**Outcome:** tests that exercise the hard cases with real assertions. Suite: 119 passing, 14 pending.
+- [x] Fixture solution `tests\Fixtures\Semantics\` (projects `Semantics.Core` and `Semantics.App`, the
+      latter referencing the former) covering: overloads, generic type and generic method, extension method,
+      `params`, partial class split across a hand-written and a generated file, nested type, interface with
+      implicit and explicit implementations, abstract/virtual/override chain, record, struct, enum, delegate,
+      event, properties, field and property initializers, constructor chaining (`: this(...)`), lambda and
+      local function calls, `nameof`/`typeof`, an attribute, target-typed `new()`, cross-project calls, and
+      calls into the base class library (`HttpClient`, `List<T>`, LINQ). Multi-targeting lives in the separate
+      `MultiTarget` fixture from Phase A.
+- [x] Expected locations come from `// @marker` comments in the fixture source, never from line numbers
+      (`SemanticsIndex.Line`). Symbols are identified by documentation id, so tests read like the key.
+- [x] Golden tests (`SemanticsGoldenTests.cs`) assert exact sets: the symbols declared in two whole files,
+      each overload's start line, kind and line for 18 symbols, the four members that call `Add(int,int)`
+      and their five call-site lines, `Add(double,double)` and `Add(string,string)` callers, closed generic
+      call, type-level inherits/implements edges, method overrides, direct callers of an interface member,
+      an abstract member, an override, and a non-virtual member, partial-class attribution, and generated flags.
+- [x] `[PendingFact(phase, what)]` marks tests that describe behavior scheduled for a later phase. They are
+      skipped in a normal run (so the suite is green and the gaps are visible in the skip list) and run with
+      `CODEINDEX_RUN_PENDING=1`, which currently fails exactly those 14 and nothing else. When one passes,
+      change it to `[Fact]`.
+- [x] The three Phase 3 query tests that only asserted `NotNull` now assert an honest envelope check
+      (empty data, no warnings, solution name) and say so; behavior is asserted by the golden tests.
+- Pending, by plan phase (all **C** unless noted):
+  - Partial class has a location in each part (`symbol_locations` table)
+  - Containers linked via `container_id`
+  - Delegates indexed
+  - Namespaces indexed
+  - Property overrides edges
+  - Member-level `implements` edges
+  - Target-typed `new()` and field-initializer creation
+  - Constructor initializer calls and initializer-owned calls
+  - Property read/write references with kinds
+  - Event use references
+  - Type-usage references (`Calculator`, and `typeof(Account)`)
+  - Extension-method calls resolve to the declared method
+  - External-symbol stubs for `HttpClient`/`List<T>` calls
+- Not covered yet: calls *through* interfaces in a query (`--through-dispatch`, Phase D), attribute usage as a
+  reference kind, `symbol_locations` counts for all symbols (needs the Phase C table), and query-command
+  goldens (Phase D defines the selectors).
 
 ### Phase C: Extraction rewrite
 **Outcome:** the index answers references and call hierarchy correctly.
@@ -306,7 +332,7 @@ Tests: 42/42 pass, but the fixture is a single 54-line file with no in-project c
 | F9 | Loader reads the TFM from XML but does not filter Roslyn projects; multi-targeted projects may be indexed once per TFM under the same path | Read (verify on Google) | Phase A (done); verify on Google in E |
 | F10 | Project filter uses substring matching: `Include("SimpleLib")` also matches `SimpleLib.Tests`; default exclude `test` matches any name containing it | Read | Phase A (done) |
 | F11 | `RegisterMsBuild` picks the highest MSBuild instance, ignoring `global.json` | Read | Phase A (done; unit-tested, verify on Google in E) |
-| F12 | Call/refs/callers tests assert only `NotNull`; fixture has no resolved in-project calls, so call edges and caller queries are effectively untested (confirmed: `callers`, `callees`, `refs` all return empty on the fixture) | **Confirmed** | Phase B |
+| F12 | Call/refs/callers tests assert only `NotNull`; fixture has no resolved in-project calls, so call edges and caller queries are effectively untested (confirmed: `callers`, `callees`, `refs` all return empty on the fixture) | **Confirmed** | Phase B (done: fixture and goldens; 14 pending tests track C/D) |
 | F13 | `diagnostics` table exists but is never written | Read | Phase A (done) |
 | F14 | Git commit read by parsing `.git/HEAD` (breaks with worktrees/packed refs) | Read | Phase A (done) |
 | F15 | Emitted paths use `\` separators on Windows; `stale` is always `false` because it is never computed | **Confirmed** | Phase A (done: paths); D (`stale`) |
