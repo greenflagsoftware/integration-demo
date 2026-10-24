@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="CodeIndexer.Cli/CodeIndexer.Cli.csproj" />
+  <Project Path="CodeIndexer.Core/CodeIndexer.Core.csproj" />
+  <Project Path="CodeIndexer.Tests/CodeIndexer.Tests.csproj" />
+</Solution>

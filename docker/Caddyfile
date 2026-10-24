@@ -1,0 +1,13 @@
+{$PUBLIC_DOMAIN} {
+	# Only live webhook URLs and the OAuth callback (e.g. Google) are public.
+	# The editor UI and REST API stay private on 127.0.0.1:5678.
+	@public path /webhook/* /webhook-waiting/* /rest/oauth2-credential/callback
+
+	handle @public {
+		reverse_proxy n8n:5678
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+}

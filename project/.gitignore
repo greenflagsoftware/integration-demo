@@ -1,0 +1,23 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.log
+*.nupkg
+
+# CodeIndexer databases
+.codeindex/
+*.db
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# NuGet
+packages/
+*.nuget.props
+*.nuget.targets
