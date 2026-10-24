@@ -1,0 +1,58 @@
+name: code-indexer
+
+# Build, test, and package the CodeIndexer tool whenever it changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "project/code-indexer/**"
+      - ".github/workflows/code-indexer.yml"
+  pull_request:
+    paths:
+      - "project/code-indexer/**"
+      - ".github/workflows/code-indexer.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Windows is where the tool is developed and used. The suite has not been run on Linux.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: project/code-indexer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build CodeIndexer.slnx -c Release
+
+      # The tests restore their own fixture solutions on first use and run the built executable end to end.
+      - name: Test
+        run: dotnet test CodeIndexer.slnx -c Release --no-build --logger "trx;LogFileName=test-results.trx"
+
+      - name: Pack the tool
+        run: dotnet pack CodeIndexer.Cli -c Release --no-build
+
+      - name: Smoke-test the packed tool
+        shell: pwsh
+        run: |
+          dotnet tool install CodeIndexer.Cli --tool-path "$env:RUNNER_TEMP/tool" --add-source artifacts --version 0.1.0
+          & "$env:RUNNER_TEMP/tool/codeindex.exe" --help | Select-String "codeindex \[command\]"
+          & "$env:RUNNER_TEMP/tool/codeindex.exe" --version
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: project/code-indexer/CodeIndexer.Tests/TestResults/*.trx
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codeindex-tool
+          path: project/code-indexer/artifacts/*.nupkg

@@ -25,6 +25,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CodeIndexer.Core\CodeIndexer.Core.csproj" />
+    <!-- Built (not referenced) so the end-to-end tests can run the real executable. -->
+    <ProjectReference Include="..\CodeIndexer.Cli\CodeIndexer.Cli.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

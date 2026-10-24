@@ -218,3 +218,42 @@ and `key`s are always stable.
 
 Database selection for queries: `--db <path>`, else `--solution <name>` via the catalog, else the only indexed
 solution if there is exactly one.
+
+---
+
+## 7. The MCP server (`codeindex mcp`)
+
+`codeindex mcp [--db P | --solution NAME]` speaks the Model Context Protocol over stdio (one JSON-RPC 2.0 message per line;
+stdout carries nothing else). It is read-only. Each tool returns **the same JSON as the matching command**, as one text content
+item, so everything above applies, including `target`/`candidates`, `stale`, and `warnings`.
+
+| Tool | Command | Required arguments |
+|---|---|---|
+| `find_symbol` | `find-symbol` | `name` (optional `kind`, `project`, `include_generated`, `include_external`, `limit`, `offset`) |
+| `search` | `search` | `text` |
+| `definition`, `show`, `outline` | same | a selector |
+| `at` | `at` | `file`, `line` (optional `column`) |
+| `refs` | `refs` | a selector (optional `ref_kinds` as a comma list, `file`, `project`, `context`, `group_by`, `limit`, `offset`) |
+| `callers`, `callees` | same | a selector (optional `depth`, `limit`, `through_dispatch`, `include_creates`, `include_external`, `exclude_generated`) |
+| `implementations` | same | a selector (optional `transitive`, `limit`) |
+| `hierarchy` | same | a selector (optional `direction`, `depth`) |
+| `index_info` | | none |
+
+A selector is any of `symbol` (a name, `Type.Member`, documentation id, or `file:line[:col]`), `id`, or `key`, with optional `kind`
+and `include_generated`. Every tool also accepts `solution` to choose among several indexed solutions. Numeric and boolean arguments
+may be sent as strings.
+
+Errors: an unknown tool or method is a JSON-RPC error (`-32602`, `-32601`); malformed JSON is `-32700`. Problems with a call (no
+index database, a missing required argument, a non-numeric id) are returned as a normal result with `isError: true` and a message
+saying what to do. A symbol that is not found, or an ambiguous one, is **not** an error: it is a normal result with `warnings`
+(and `candidates`).
+
+### `index_info` data
+
+| Field | Description |
+|---|---|
+| `database`, `tool_version`, `repo_root` | Where the index is and what built it |
+| `projects` | `{ name, path, tfm, is_external, files, symbols }` for each project in the index |
+| `files`, `symbols`, `external_symbols`, `references`, `edges` | Counts (`symbols` excludes namespaces and library stubs) |
+| `diagnostics`, `diagnostic_count` | The first 10 warnings and errors from indexing (unrestored projects, compile errors, load failures) |
+| `indexed_solutions` | Every solution in the catalog next to this database: `{ name, indexed_at, commit }` |

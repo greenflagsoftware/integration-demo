@@ -3,6 +3,15 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>CodeIndexer.Cli</RootNamespace>
+
+    <!-- Packaged as a .NET tool: `dotnet tool install CodeIndexer.Cli` gives a `codeindex` command. -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>codeindex</ToolCommandName>
+    <PackageId>CodeIndexer.Cli</PackageId>
+    <Description>Roslyn-based code index for .NET solutions: definition, references, call hierarchy, implementations and type hierarchy from a local SQLite index, for people and AI agents. Also runs as an MCP server (codeindex mcp).</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>roslyn;code-navigation;call-hierarchy;mcp;dotnet-tool</PackageTags>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)..\artifacts</PackageOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -11,6 +20,10 @@
 
   <ItemGroup>
     <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

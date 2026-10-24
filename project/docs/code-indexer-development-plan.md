@@ -8,7 +8,7 @@ small, structured, trustworthy answers.
 The indexer is a **standalone, general-purpose code-intelligence tool**. It knows nothing about any
 consumer (workflow engines, mocking, personas). Consumers build on its queries.
 
-Status: **Revised plan (2026-10-24), after a code review. Phases A, B, C, D, E, and F are done.** Phases 0-3 of the first plan produced a working
+Status: **Revised plan (2026-10-24), after a code review. All phases (A to G) are done.** Phases 0-3 of the first plan produced a working
 skeleton (42 tests pass) but the extraction and storage layers have correctness gaps that defeat the
 purpose (section 7). The revised phases fix those before adding features.
 
@@ -409,11 +409,46 @@ every indexed project would be redone anyway. `--full` forces a rebuild; `--dry-
   pins one is noticed only on the next run that loads the solution; `--watch` is not implemented (deferred, as the plan
   allowed): run `index` before a query, or rely on the `stale` flag.
 
-### Phase G: Packaging and agent ergonomics
-- [ ] `dotnet tool` packaging, published ReadyToRun (a query goes from about 265 ms to about 215 ms; the .NET host
-      start-up is the rest); README with PowerShell examples; consistent, short `--help` text.
-- [ ] Decide on a `serve` mode (stdio JSON) and/or an MCP wrapper.
-- [ ] CI workflow running the xUnit suite.
+### Phase G: Packaging and agent ergonomics (done 2026-10-24)
+**Outcome:** installable, self-describing, and usable by an agent without a process start per lookup. Suite: 296 passing.
+- [x] **`dotnet tool` package** (`CodeIndexer.Cli`, command `codeindex`, version from `<Version>` in `Directory.Build.props`;
+      a test keeps it equal to the version stamped into indexes). `dotnet pack CodeIndexer.Cli -c Release` writes
+      `artifacts\CodeIndexer.Cli.0.1.0.nupkg` (27 MB, almost all Roslyn). Verified by installing it into an empty tool path and
+      indexing and querying from an unrelated directory (the MSBuild host files are in the package), and as a local tool
+      (`dotnet new tool-manifest`, then `dotnet codeindex ...`). Not published anywhere.
+- [x] **ReadyToRun:** a framework-dependent tool package cannot carry a ReadyToRun image, so it is JIT-compiled: about 265 ms
+      per CLI call, of which .NET host start-up is about 158 ms. `dotnet publish CodeIndexer.Cli -r win-x64
+      -p:PublishReadyToRun=true` gives about 215 ms for people who want it. This is the reason for the next item.
+- [x] **Decision: an MCP server, not a custom `serve` protocol.** A persistent process turns a 265 ms call into a 4 ms one
+      (measured through a real process over stdio: first call about 90 ms while JIT warms up, then 4 ms). Of the two forms
+      considered, MCP is what agents already speak (Claude Code, Cursor, and others register a stdio server in one line),
+      while a bespoke line protocol would need a client written for every use. `codeindex mcp [--db | --solution]` is
+      read-only: 12 tools (`find_symbol`, `search`, `definition`, `show`, `outline`, `at`, `refs`, `callers`, `callees`,
+      `implementations`, `hierarchy`, `index_info`) whose descriptions and argument schemas are written for a model; results
+      are the same JSON as the command line, including `candidates` for an ambiguous name and `stale`; errors a model can act
+      on (no index, missing argument, non-numeric id) are tool errors, not protocol errors; each call opens the index fresh so
+      staleness is always current; optional `solution` selects among several indexes. It never writes the index.
+      **Not done:** exercising it from a real Claude Code or Cursor session; it is tested with 24 in-process protocol tests
+      (handshake and version negotiation, notifications, ids, errors, every tool) and one test that drives the real executable
+      over stdin and stdout and checks nothing but JSON-RPC reaches stdout.
+- [x] **`--help` for an LLM:** the program is named `codeindex` (it printed `CodeIndexer.Cli`); the root help states what the
+      tool is for, a three-line workflow, how to name a symbol, and that an ambiguous name returns candidates; commands have
+      one-line descriptions in a consistent voice; empty `[]` and `[default: False]` noise is gone; arguments that must be given
+      (`find-symbol <name>`, `search <text>`, `at <position>`) are required, so a missing one is an error instead of an empty
+      result; `index --db` says where the database is written.
+- [x] **README** (`README.md`, also the package readme): what it answers, install, PowerShell quick start, command table, symbol
+      selectors, freshness, agent setup with a suggested prompt, what to know before trusting a result, measured speed,
+      development layout.
+- [x] **CLI tests:** the command-line layer previously had none. Nine tests run the built executable: help text, per-command help,
+      required-argument errors, exit code 2 with a message on stderr when there is no index, index then query then index again
+      (up to date) then `--full --dry-run`, and a real MCP session.
+- [x] **CI** (`.github\workflows\code-indexer.yml`, repository root): on changes to `project/code-indexer`, on Windows: build, test,
+      pack, install the packed tool and run it, upload the test results and the `.nupkg`. **Not run on GitHub from here.** It
+      parses as YAML and each command in it was run locally. The suite has only ever run on Windows.
+- Moved out of the core by this phase: `IndexLocator` (finding the index database) now lives in Core and is shared by the CLI
+  and the MCP server.
+- Possible follow-ups, not needed now: publish the package to a feed; a Linux/macOS run of the suite; an MCP tool to refresh the
+  index (kept out so the server stays read-only); `--watch`.
 
 ### Later ideas (parked)
 - Multi-solution or multi-repo index; NuGet dependency metadata; public-API surface diff between versions.
@@ -442,7 +477,7 @@ core indexer.
 | **External symbol volume** | Indexing every referenced framework symbol adds rows. Mitigate by inserting stubs only for symbols actually referenced, and measure. |
 | **Open: other SDKs after Google?** | Decides how much to invest in the non-SDK csproj fallback. |
 | **Open: tool name and repo** | Placeholder `codeindex`. Decide whether it lives in this repo or its own. |
-| **Open: `serve` mode vs per-call CLI** | Decide after measuring process-startup cost in Phase E. |
+| **Settled: persistent process** | Measured in Phase E (265 ms per call, 4 ms warm); answered in Phase G with an MCP server. |
 
 ---
 

@@ -10,25 +10,34 @@ using Microsoft.Data.Sqlite;
 Console.OutputEncoding = new UTF8Encoding(false);
 
 var rootCommand = new RootCommand(
-    "CodeIndexer - answers code navigation questions about a .NET solution from a Roslyn-built SQLite index. " +
-    "Typical flow: 'index <solution.sln>', then 'find-symbol', 'definition', 'refs', 'callers', 'callees', " +
-    "'implementations', 'hierarchy', 'outline', 'at'. Output is JSON unless --format table. " +
-    "Name a symbol by name, --id, --key, or file:line[:col]; an ambiguous name returns candidates.");
+    "CodeIndexer: semantic code navigation for .NET, from a Roslyn-built index in SQLite. It answers where a symbol is defined, " +
+    "used, called, or implemented exactly, where grep can only guess.\n" +
+    "\n" +
+    "Workflow:\n" +
+    "  codeindex index MyApp.sln                  build the index, or update it (fast when nothing changed)\n" +
+    "  codeindex find-symbol OrderService          locate a symbol; the result includes its id\n" +
+    "  codeindex callers --id 42 --depth 2         then ask about it: definition, refs, callers, callees,\n" +
+    "                                              implementations, hierarchy, outline, show\n" +
+    "\n" +
+    "Naming a symbol: by name (Add, Calculator.Add), by --id or --key from a previous result, or by position (src/Foo.cs:12:5).\n" +
+    "A name matching several symbols returns \"candidates\" instead of guessing; pick one by id.\n" +
+    "Output is JSON; add --format table for people. Every result says whether the index is stale.\n" +
+    "AI agents: 'codeindex mcp' serves these commands over the Model Context Protocol.") { Name = "codeindex" };
 
 // ---- shared options ------------------------------------------------------------------------------
 
-var dbOption = new Option<string>("--db", () => "", "Path to the index database (default: the only indexed solution)");
-var solutionOption = new Option<string>("--solution", () => "", "Name of an indexed solution (see 'list')");
+var dbOption = new Option<string>("--db", "Path to the index database (default: the only indexed solution)");
+var solutionOption = new Option<string>("--solution", "Name of an indexed solution (see 'list')");
 var formatOption = new Option<string>("--format", () => "json", "Output format: json or table");
 
 var idOption = new Option<long?>("--id", "Symbol id from a previous result");
-var keyOption = new Option<string>("--key", () => "", "Symbol key (or documentation id) from a previous result");
-var kindOption = new Option<string>("--kind", () => "", "Only symbols of this kind (class, method, property, ...)");
-var includeGeneratedOption = new Option<bool>("--include-generated", () => false, "Include generated code");
-var includeExternalOption = new Option<bool>("--include-external", () => false, "Include symbols declared outside the indexed projects");
+var keyOption = new Option<string>("--key", "Symbol key (or documentation id) from a previous result");
+var kindOption = new Option<string>("--kind", "Only symbols of this kind (class, method, property, ...)");
+var includeGeneratedOption = new Option<bool>("--include-generated", "Include generated code");
+var includeExternalOption = new Option<bool>("--include-external", "Include symbols declared outside the indexed projects");
 
-Argument<string> SymbolArg(string name = "symbol", string description = "Symbol name, Type.Member, documentation id, or file:line[:col]") =>
-    new(name, () => "", description);
+Argument<string> SymbolArg(string name = "symbol", string description = "Symbol: a name, Type.Member, documentation id, or file:line[:col] (or use --id / --key)", bool required = false) =>
+    new(name, description) { Arity = required ? ArgumentArity.ExactlyOne : ArgumentArity.ZeroOrOne };
 
 SymbolSelector Selector(InvocationContext ctx, Argument<string> arg) => new(
     Id: ctx.ParseResult.GetValueForOption(idOption),
@@ -60,7 +69,7 @@ Command Query(string name, string description, Argument? arg, Action<Command>? c
 
     command.SetHandler(ctx =>
     {
-        var dbPath = ResolveDbPath(ctx.ParseResult.GetValueForOption(dbOption)!, ctx.ParseResult.GetValueForOption(solutionOption)!, out var problem);
+        var dbPath = IndexLocator.ResolveDbPath(ctx.ParseResult.GetValueForOption(dbOption), ctx.ParseResult.GetValueForOption(solutionOption), out var problem);
         if (dbPath is null)
         {
             Console.Error.WriteLine(problem);
@@ -86,15 +95,15 @@ Command Query(string name, string description, Argument? arg, Action<Command>? c
 // ---- index ---------------------------------------------------------------------------------------
 
 var indexCommand = new Command("index",
-    "Index a .NET solution into a SQLite database. Updates an existing index incrementally (only projects affected by a " +
-    "change are redone) and does nothing if nothing changed; use --full to rebuild from scratch");
+    "Build or update the index for a solution. Redoes only what a change affects; does nothing if nothing changed");
 var solutionArg = new Argument<FileInfo>("solution", "Path to the .sln, .slnx, or .csproj file");
-var includeOption = new Option<string[]>("--include", () => Array.Empty<string>(), "Project names to include (exact, or with * and ? wildcards)");
-var excludeOption = new Option<string[]>("--exclude", () => Array.Empty<string>(), "Project names to exclude (exact, or with * and ? wildcards)");
-var fullOption = new Option<bool>("--full", () => false, "Rebuild the whole index instead of updating it");
-var dryRunOption = new Option<bool>("--dry-run", () => false, "Show what would be redone and why, without changing the index");
+var includeOption = new Option<string[]>("--include", "Project names to include (exact, or with * and ? wildcards)");
+var excludeOption = new Option<string[]>("--exclude", "Project names to exclude (exact, or with * and ? wildcards)");
+var indexDbOption = new Option<string>("--db", "Where to write the index (default: .codeindex/<solution>.db next to the solution)");
+var fullOption = new Option<bool>("--full", "Rebuild the whole index instead of updating it");
+var dryRunOption = new Option<bool>("--dry-run", "Show what would be redone and why, without changing the index");
 indexCommand.AddArgument(solutionArg);
-indexCommand.AddOption(dbOption);
+indexCommand.AddOption(indexDbOption);
 indexCommand.AddOption(includeOption);
 indexCommand.AddOption(excludeOption);
 indexCommand.AddOption(fullOption);
@@ -149,7 +158,7 @@ indexCommand.SetHandler(async (FileInfo solution, string db, string[] include, s
                       string.Join(", ", result.Timings.Select(t => $"{t.Key} {t.Value.TotalSeconds:F1}s")));
     foreach (var d in result.Diagnostics)
         Console.WriteLine($"  [diag] {d}");
-}, solutionArg, dbOption, includeOption, excludeOption, fullOption, dryRunOption);
+}, solutionArg, indexDbOption, includeOption, excludeOption, fullOption, dryRunOption);
 rootCommand.AddCommand(indexCommand);
 
 // ---- info / list / resolve -----------------------------------------------------------------------
@@ -159,7 +168,7 @@ infoCommand.AddOption(dbOption);
 infoCommand.AddOption(solutionOption);
 infoCommand.SetHandler(ctx =>
 {
-    var dbPath = ResolveDbPath(ctx.ParseResult.GetValueForOption(dbOption)!, ctx.ParseResult.GetValueForOption(solutionOption)!, out var problem);
+    var dbPath = IndexLocator.ResolveDbPath(ctx.ParseResult.GetValueForOption(dbOption), ctx.ParseResult.GetValueForOption(solutionOption), out var problem);
     if (dbPath is null) { Console.Error.WriteLine(problem); ctx.ExitCode = 2; return; }
 
     using var infoDb = new IndexDatabase(dbPath, "");
@@ -192,7 +201,7 @@ rootCommand.AddCommand(infoCommand);
 var listCommand = new Command("list", "List all indexed solutions in the catalog");
 listCommand.SetHandler(() =>
 {
-    var entries = LoadCatalog(out var catalogPath);
+    var entries = IndexLocator.LoadCatalog(out var catalogPath);
     if (entries is null) { Console.WriteLine("No catalog found. No solutions have been indexed yet."); return; }
     Console.WriteLine($"Catalog: {catalogPath}\n");
     foreach (var e in entries)
@@ -211,7 +220,7 @@ var resolveArg = new Argument<string>("query", "Solution name or path to resolve
 resolveCommand.AddArgument(resolveArg);
 resolveCommand.SetHandler((string query) =>
 {
-    var catalogPath = FindCatalogPath();
+    var catalogPath = IndexLocator.FindCatalogPath();
     if (catalogPath is null) { Console.WriteLine("No catalog found."); return; }
     using var conn = new SqliteConnection($"Data Source={catalogPath};Pooling=False");
     conn.Open();
@@ -223,28 +232,28 @@ rootCommand.AddCommand(resolveCommand);
 
 // ---- search and lookup ---------------------------------------------------------------------------
 
-var findNameArg = SymbolArg("name", "Symbol name, prefix, or full-text query");
+var findNameArg = SymbolArg("name", "Name, prefix, or part of a name to look for (other input is a full-text query)", required: true);
 var limit20 = () => new Option<int>("--limit", () => 20, "Maximum results");
 var findLimit = limit20();
 var findOffset = new Option<int>("--offset", () => 0, "Results to skip");
-var findProject = new Option<string>("--project", () => "", "Only symbols in projects whose name or path contains this");
-rootCommand.AddCommand(Query("find-symbol", "Find symbols by name (exact, then prefix, then substring; full-text for other input)", findNameArg,
+var findProject = new Option<string>("--project", "Only symbols in projects whose name or path contains this");
+rootCommand.AddCommand(Query("find-symbol", "Find symbols by name (exact, then prefix, then substring) and get their ids", findNameArg,
     c => { c.AddOption(kindOption); c.AddOption(findProject); c.AddOption(includeGeneratedOption); c.AddOption(includeExternalOption); c.AddOption(findLimit); c.AddOption(findOffset); },
     (ctx, q) => q.FindSymbol(ctx.ParseResult.GetValueForArgument(findNameArg), new FindOptions(
         Blank(ctx.ParseResult.GetValueForOption(kindOption)), Blank(ctx.ParseResult.GetValueForOption(findProject)),
         ctx.ParseResult.GetValueForOption(includeGeneratedOption), ctx.ParseResult.GetValueForOption(includeExternalOption),
         ctx.ParseResult.GetValueForOption(findLimit), ctx.ParseResult.GetValueForOption(findOffset)))));
 
-var searchTextArg = SymbolArg("text", "Full-text query over names, signatures, and docs (FTS5 syntax)");
+var searchTextArg = SymbolArg("text", "Full-text query (FTS5 syntax: words, \"phrases\", prefix*, AND/OR)", required: true);
 var searchLimit = limit20();
-rootCommand.AddCommand(Query("search", "Full-text search over symbol names, signatures, and documentation", searchTextArg,
+rootCommand.AddCommand(Query("search", "Full-text search over symbol names, signatures, and XML documentation", searchTextArg,
     c => { c.AddOption(includeGeneratedOption); c.AddOption(includeExternalOption); c.AddOption(searchLimit); },
     (ctx, q) => q.Search(ctx.ParseResult.GetValueForArgument(searchTextArg), new SearchOptions(
         ctx.ParseResult.GetValueForOption(includeGeneratedOption), ctx.ParseResult.GetValueForOption(includeExternalOption),
         ctx.ParseResult.GetValueForOption(searchLimit)))));
 
-var atArg = SymbolArg("position", "file:line or file:line:col (1-based)");
-rootCommand.AddCommand(Query("at", "The symbol at a source position: the symbol used there, else the declaration containing it", atArg, null,
+var atArg = SymbolArg("position", "file:line or file:line:col (1-based; the file may be any unique path suffix)", required: true);
+rootCommand.AddCommand(Query("at", "The symbol at a source position: what is used there, else the declaration containing it", atArg, null,
     (ctx, q) =>
     {
         var selector = new SymbolSelector(Text: ctx.ParseResult.GetValueForArgument(atArg));
@@ -254,31 +263,31 @@ rootCommand.AddCommand(Query("at", "The symbol at a source position: the symbol 
     }));
 
 var defArg = SymbolArg();
-rootCommand.AddCommand(Query("definition", "Where a symbol is declared (one location per declaration)", defArg, AddSelectorOptions,
+rootCommand.AddCommand(Query("definition", "Where a symbol is declared (one location per declaration; a partial class has several)", defArg, AddSelectorOptions,
     (ctx, q) => q.Definition(Selector(ctx, defArg))));
 
 var showArg = SymbolArg();
-var showSource = new Option<bool>("--source", () => false, "Include the source of the declaration");
+var showSource = new Option<bool>("--source", "Include the source of the declaration");
 var showMaxLines = new Option<int>("--max-lines", () => 200, "Maximum source lines with --source");
-rootCommand.AddCommand(Query("show", "A symbol's details, optionally with its source", showArg,
+rootCommand.AddCommand(Query("show", "A symbol's signature, documentation, and (with --source) its source code", showArg,
     c => { AddSelectorOptions(c); c.AddOption(showSource); c.AddOption(showMaxLines); },
     (ctx, q) => q.Show(Selector(ctx, showArg), ctx.ParseResult.GetValueForOption(showSource), ctx.ParseResult.GetValueForOption(showMaxLines))));
 
-var outlineArg = SymbolArg("target", "A file path (outlines the file) or a type (outlines its members)");
-rootCommand.AddCommand(Query("outline", "Structure of a file or type: symbols nested by container", outlineArg, AddSelectorOptions,
+var outlineArg = SymbolArg("target", "A file path (outlines the file) or a type name (outlines its members); or use --id / --key");
+rootCommand.AddCommand(Query("outline", "Structure of a file or type: its symbols nested by container, with line numbers", outlineArg, AddSelectorOptions,
     (ctx, q) => q.Outline(Selector(ctx, outlineArg))));
 
 // ---- references and call graph -------------------------------------------------------------------
 
 var refsArg = SymbolArg();
-var refKindOption = new Option<string>("--ref-kind", () => "", "Only these reference kinds, comma separated (call, read, write, type-use, create, inherit, implement, attribute, typeof, nameof, use)");
-var refsFile = new Option<string>("--file", () => "", "Only references in files whose path contains this");
-var refsProject = new Option<string>("--project", () => "", "Only references in projects whose name or path contains this");
-var refsContext = new Option<bool>("--context", () => false, "Include the source line of each reference");
+var refKindOption = new Option<string>("--ref-kind", "Only these reference kinds, comma separated (call, read, write, type-use, create, inherit, implement, attribute, typeof, nameof, use)");
+var refsFile = new Option<string>("--file", "Only references in files whose path contains this");
+var refsProject = new Option<string>("--project", "Only references in projects whose name or path contains this");
+var refsContext = new Option<bool>("--context", "Include the source line of each reference");
 var refsGroup = new Option<string>("--group-by", () => "none", "Group results: none, file, member, or kind");
 var refsLimit = new Option<int>("--limit", () => 100, "Maximum references");
 var refsOffset = new Option<int>("--offset", () => 0, "References to skip");
-rootCommand.AddCommand(Query("refs", "Every recorded use of a symbol, with kind and containing member", refsArg,
+rootCommand.AddCommand(Query("refs", "Every use of a symbol, with the kind of use and the member containing it", refsArg,
     c => { AddSelectorOptions(c); c.AddOption(refKindOption); c.AddOption(refsFile); c.AddOption(refsProject); c.AddOption(refsContext); c.AddOption(refsGroup); c.AddOption(refsLimit); c.AddOption(refsOffset); },
     (ctx, q) => q.Refs(Selector(ctx, refsArg), new RefsOptions(
         Kinds: Blank(ctx.ParseResult.GetValueForOption(refKindOption))?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
@@ -295,11 +304,11 @@ Command CallCommand(string name, string description, bool incoming)
     var arg = SymbolArg();
     var depth = new Option<int>("--depth", () => 1, "How many calls deep to follow (0 = unlimited)");
     var limit = new Option<int>("--limit", () => 50, "Maximum members returned");
-    var dispatch = new Option<bool>("--through-dispatch", () => false,
+    var dispatch = new Option<bool>("--through-dispatch",
         incoming ? "Count calls made through an interface/abstract/base member this symbol implements or overrides"
                  : "Also list the members that implement or override an interface/abstract member that is called");
-    var creates = new Option<bool>("--include-creates", () => false, "Also follow object creation (new)");
-    var excludeGenerated = new Option<bool>("--exclude-generated", () => false, "Leave out members declared in generated code");
+    var creates = new Option<bool>("--include-creates", "Also follow object creation (new)");
+    var excludeGenerated = new Option<bool>("--exclude-generated", "Leave out members declared in generated code");
     return Query(name, description, arg,
         c => { AddSelectorOptions(c); c.AddOption(depth); c.AddOption(limit); c.AddOption(dispatch); c.AddOption(creates); c.AddOption(includeExternalOption); c.AddOption(excludeGenerated); },
         (ctx, q) =>
@@ -311,13 +320,13 @@ Command CallCommand(string name, string description, bool incoming)
             return incoming ? q.Callers(Selector(ctx, arg), options) : q.Callees(Selector(ctx, arg), options);
         });
 }
-rootCommand.AddCommand(CallCommand("callers", "Members that call a symbol (incoming calls), with call sites", incoming: true));
-rootCommand.AddCommand(CallCommand("callees", "Members a symbol calls (outgoing calls), with call sites", incoming: false));
+rootCommand.AddCommand(CallCommand("callers", "Methods that call a symbol (incoming call hierarchy), with call sites", incoming: true));
+rootCommand.AddCommand(CallCommand("callees", "Methods a symbol calls (outgoing call hierarchy), with call sites", incoming: false));
 
 var implArg = SymbolArg();
-var implTransitive = new Option<bool>("--transitive", () => false, "Follow the chain (implementers of implementers, overrides of overrides)");
+var implTransitive = new Option<bool>("--transitive", "Follow the chain (implementers of implementers, overrides of overrides)");
 var implLimit = new Option<int>("--limit", () => 50, "Maximum results");
-rootCommand.AddCommand(Query("implementations", "Types implementing or inheriting a type, or members implementing or overriding a member", implArg,
+rootCommand.AddCommand(Query("implementations", "Types that implement or derive from a type, or members that implement or override a member", implArg,
     c => { AddSelectorOptions(c); c.AddOption(implTransitive); c.AddOption(implLimit); },
     (ctx, q) => q.Implementations(Selector(ctx, implArg), ctx.ParseResult.GetValueForOption(implTransitive), ctx.ParseResult.GetValueForOption(implLimit))));
 
@@ -325,9 +334,25 @@ var hierArg = SymbolArg();
 var hierDirection = new Option<string>("--direction", () => "both", "up (supertypes), down (subtypes), or both");
 var hierDepth = new Option<int>("--depth", () => 3, "Maximum depth");
 var hierLimit = new Option<int>("--limit", () => 200, "Maximum nodes");
-rootCommand.AddCommand(Query("hierarchy", "Supertypes and subtypes of a type", hierArg,
+rootCommand.AddCommand(Query("hierarchy", "Base types and derived types of a type", hierArg,
     c => { AddSelectorOptions(c); c.AddOption(hierDirection); c.AddOption(hierDepth); c.AddOption(hierLimit); },
     (ctx, q) => q.Hierarchy(Selector(ctx, hierArg), ctx.ParseResult.GetValueForOption(hierDirection)!, ctx.ParseResult.GetValueForOption(hierDepth), ctx.ParseResult.GetValueForOption(hierLimit))));
+
+// ---- mcp -----------------------------------------------------------------------------------------
+
+var mcpCommand = new Command("mcp",
+    "Serve these commands to an AI agent over the Model Context Protocol (stdio, read-only; one warm process, so lookups take milliseconds)");
+mcpCommand.AddOption(dbOption);
+mcpCommand.AddOption(solutionOption);
+mcpCommand.SetHandler(async ctx =>
+{
+    // stdout carries only protocol messages; anything else goes to stderr.
+    Console.InputEncoding = new UTF8Encoding(false);
+    var server = new CodeIndexer.Core.Mcp.McpServer(
+        Blank(ctx.ParseResult.GetValueForOption(dbOption)), Blank(ctx.ParseResult.GetValueForOption(solutionOption)));
+    await server.RunAsync(Console.In, Console.Out, ctx.GetCancellationToken());
+});
+rootCommand.AddCommand(mcpCommand);
 
 // ---- helpers -------------------------------------------------------------------------------------
 
@@ -342,65 +367,6 @@ static string FindRepoRoot(string solutionPath)
         dir = Path.GetDirectoryName(dir);
     }
     return Path.GetDirectoryName(Path.GetFullPath(solutionPath)) ?? ".";
-}
-
-static string? FindCatalogPath()
-{
-    var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-    foreach (var start in new[] { Directory.GetCurrentDirectory(), profile, Path.Combine(profile, ".codeindex") })
-    {
-        var probe = start;
-        while (probe is not null)
-        {
-            var candidate = Path.Combine(probe, ".codeindex", "catalog.db");
-            if (File.Exists(candidate)) return candidate;
-            var parent = Path.GetDirectoryName(probe);
-            if (parent == probe) break;
-            probe = parent;
-        }
-    }
-    return null;
-}
-
-static List<CatalogEntry>? LoadCatalog(out string? catalogPath)
-{
-    catalogPath = FindCatalogPath();
-    if (catalogPath is null) return null;
-    using var conn = new SqliteConnection($"Data Source={catalogPath};Pooling=False");
-    conn.Open();
-    return CatalogDatabase.List(conn);
-}
-
-/// <summary>--db wins; then --solution via the catalog; with neither, the only indexed solution if there is exactly one.</summary>
-static string? ResolveDbPath(string db, string solution, out string? problem)
-{
-    problem = null;
-    if (!string.IsNullOrEmpty(db))
-    {
-        if (File.Exists(db)) return db;
-        problem = $"No index database at '{db}'. Run 'codeindex index <solution>' first.";
-        return null;
-    }
-
-    var entries = LoadCatalog(out _);
-    if (entries is null || entries.Count == 0)
-    {
-        problem = "No index database found. Run 'codeindex index <solution>' first, or pass --db.";
-        return null;
-    }
-
-    if (!string.IsNullOrEmpty(solution))
-    {
-        var match = entries.FirstOrDefault(e => e.SolutionName.Equals(solution, StringComparison.OrdinalIgnoreCase))
-                    ?? entries.FirstOrDefault(e => e.SolutionName.Contains(solution, StringComparison.OrdinalIgnoreCase));
-        if (match is not null && File.Exists(match.DatabasePath)) return match.DatabasePath;
-        problem = $"No indexed solution matches '{solution}'. Indexed: {string.Join(", ", entries.Select(e => e.SolutionName))}.";
-        return null;
-    }
-
-    if (entries.Count == 1 && File.Exists(entries[0].DatabasePath)) return entries[0].DatabasePath;
-    problem = $"Several solutions are indexed ({string.Join(", ", entries.Select(e => e.SolutionName))}); pass --solution <name> or --db <path>.";
-    return null;
 }
 
 return await rootCommand.InvokeAsync(args);

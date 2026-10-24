@@ -21,3 +21,5 @@ obj/
 packages/
 *.nuget.props
 *.nuget.targets
+# Packaged tools
+artifacts/

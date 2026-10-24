@@ -11,12 +11,14 @@ namespace CodeIndexer.Core.Queries;
 public sealed partial class SymbolQueries : IDisposable
 {
     private readonly SqliteConnection _connection;
+    private readonly string _dbPath;
     private bool _disposed;
     private string? _repoRoot;
     private StalenessResult? _staleness;
 
     public SymbolQueries(string dbPath)
     {
+        _dbPath = dbPath;
         var builder = new SqliteConnectionStringBuilder
         {
             DataSource = dbPath,
