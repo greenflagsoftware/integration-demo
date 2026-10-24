@@ -114,7 +114,7 @@ public class IndexEngineTests
             while (reader.Read())
                 meta[reader.GetString(0)] = reader.GetString(1);
 
-            Assert.Equal("2", meta["schema_version"]);
+            Assert.Equal("3", meta["schema_version"]);
             Assert.Equal("0.1.0", meta["tool_version"]);
             Assert.NotNull(meta["indexed_at"]);
             Assert.NotNull(meta["repo_root"]);

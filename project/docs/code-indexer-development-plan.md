@@ -1,234 +1,271 @@
 # .NET Code Indexer: Development Plan
 
 A command-line tool that uses Roslyn to analyze .NET codebases and writes a queryable index to a SQLite
-database. Its main consumer is **Frank** (the Cursor persona), who uses it to navigate SDK code quickly
-instead of reading files blindly, and who needs to find every remote operation an SDK performs.
+database. It plays the role of a **language server for AI agents**: instead of `grep`, an agent asks
+precise questions (where is this defined, who references it, who calls it, what implements it) and gets
+small, structured, trustworthy answers.
 
-Status: **Draft plan.** Update the phase checklists as work completes.
+The indexer is a **standalone, general-purpose code-intelligence tool**. It knows nothing about any
+consumer (workflow engines, mocking, personas). Consumers build on its queries.
+
+Status: **Revised plan (2026-10-24), after a code review.** Phases 0-3 of the first plan produced a working
+skeleton (42 tests pass) but the extraction and storage layers have correctness gaps that defeat the
+purpose (section 7). The revised phases fix those before adding features.
 
 ---
 
 ## 1. Goals and non-goals
 
 ### Goals
-- Build a durable, queryable index of a .NET solution: projects, files, types, members, references,
-  inheritance/implementation, and call relationships.
-- Answer Frank's everyday navigation questions in milliseconds, with small, structured output (JSON)
-  that doesn't flood an LLM's context.
-- Help Frank find **remote operations** in SDK code: HTTP calls, endpoint/URL literals, base-address
-  configuration, and auth/token flows, feeding the "SDK call → mock workflow" coverage table.
-- Run locally on Windows from PowerShell, with no server and no network access.
-- Support incremental re-indexing, so a re-run after a small change is fast.
+- Answer the questions an agent would otherwise use `grep` for, **correctly**: definition, references,
+  implementations, incoming/outgoing calls, type hierarchy, file outline, and symbol search.
+- Be precise about identity: overloads, generics, partial classes, nested types, and same-named symbols in
+  different projects are distinct symbols, and every answer says which one it means.
+- Return small structured JSON by default (limits, truncation flags, staleness), cheap for an LLM to read.
+- Include **external symbols** (framework and NuGet APIs the code calls) so "who calls `X`?" works for
+  library APIs too, not only code in the solution.
+- Run locally on Windows from PowerShell with no network access; incremental re-indexing later.
 
-### Non-goals (for now)
-- Languages other than C#/VB.NET. Python, Go, and other SDKs are out of scope; Frank reads those directly.
-- A GUI, a language server, or IDE integration.
-- Replacing the compiler or catching build errors. The indexer reports diagnostics but isn't a build tool.
-- Cross-solution or cross-repository indexing (a possible later phase).
+### Non-goals
+- Anything specific to a consumer or domain: remote-operation detection, mock generation, workflow
+  tooling, persona integration. (See "Consumer-layer ideas" at the end.)
+- Languages other than C#/VB.NET; a GUI; IDE integration; replacing the compiler.
+- Cross-repository indexing (a possible later phase).
+
+### How it maps to LSP
+
+| LSP request | Command | Notes |
+|---|---|---|
+| `workspace/symbol` | `find-symbol`, `search` | Name and full-text search |
+| `textDocument/documentSymbol` | `outline` | Members of a file or type |
+| `textDocument/definition` | `definition` | By selector or `file:line:col` |
+| `textDocument/references` | `refs` | With reference kinds (call, read, write, type-use, ...) |
+| `textDocument/implementation` | `implementations` | Interface/abstract members and types |
+| `callHierarchy/incomingCalls` | `callers` | With call-site lines; can follow dispatch |
+| `callHierarchy/outgoingCalls` | `callees` | With call-site lines |
+| `typeHierarchy/*` | `hierarchy` | Supertypes and subtypes |
+| `textDocument/hover` | `show` | Signature, docs, optional source |
 
 ---
 
 ## 1a. Reference target: Google Cloud .NET SDK
 
-The first real codebase the indexer must handle is the user's fork of the Google SDK:
-`E:\Dev\demos\g-api\google-cloud-dotnet` (surveyed 2026-10-24). What the survey found, and what it means:
+The first large real codebase is the user's fork: `E:\Dev\demos\g-api\google-cloud-dotnet` (surveyed
+2026-10-24). It is a **stress test** for the generic tool, not something the tool is specialized for.
 
-| Finding | Implication for the indexer |
+| Finding | Implication |
 |---|---|
-| **No root solution.** 356 packages under `apis\`, each with its own `.sln` (for example `apis\Google.Cloud.Storage.V1\Google.Cloud.Storage.V1.sln`). | The unit of indexing is **one API solution** (or one `.csproj`), not the whole repo. Indexing everything in one go is a later, optional mode (Phase 6). |
-| **1,139 projects**, mostly the library plus its tests, snippets, and tooling. | Need `--include`/`--exclude` filters (for example skip `*.Tests`, `*.Snippets`, `*.BenchmarkingTool`, `*.CleanTestData`). Default to library projects only. |
-| **Multi-targeting:** 704 projects are `net8.0;net462`, 352 are `netstandard2.0;net462`. | Roslyn loads one target framework at a time. Pick one **primary TFM per project** (prefer `net8.0`, else `netstandard2.0`) and record which one was indexed. `#if` branches for the other TFMs won't be seen; document this. |
-| Projects are **SDK-style** and use central package management (`Directory.Packages.props`); `global.json` pins .NET SDK **8.0.426**. | Good news: the .NET SDK's MSBuild can load them, so Visual Studio isn't required for this target. The indexer must run under (or find) the pinned SDK, and `dotnet restore` is a precondition. The net462 TFM may need reference assemblies, but we avoid it by indexing the net8.0/netstandard2.0 TFM. |
-| **Two code flavors:** (a) gRPC-generated clients (for example `Google.Cloud.Speech.V1`, with `*Grpc.cs` and `*Client` classes), and (b) REST wrappers over `Google.Apis.*` (for example `Google.Cloud.Storage.V1` wrapping `Google.Apis.Storage.v1`). | Remote-operation detection (Phase 4) needs both a **gRPC detector** (client stubs, service descriptors, RPC method names) and a **REST detector** (Google.Apis request classes, HTTP verbs, paths). Shared infrastructure sits in `Google.Api.Gax` / `Gax.Rest`, which is where base-address and credential seams are likely to live. |
-| **Large amounts of generated code** (for example the 224 `.cs` files in Storage alone, with much more in gRPC packages). | Tag symbols and files with `is_generated` (detect `<auto-generated>` headers, `[GeneratedCode]`, `.g.cs`, `*Grpc.cs`). Queries exclude generated code by default but can include it with a flag. |
-| Hand-written layers sit on top of the generated code (for example `StorageClient`, `*Client.Partial.cs`). | The most useful answers to Frank come from hand-written code, plus the generated service surface. Make this distinction first-class in outputs. |
-| Repo also contains `docs`, `tools`, `generator-input`, `conformance-tests` (a git submodule). | Exclude these paths from indexing by default. |
+| **No root solution.** 356 packages under `apis\`, each with its own `.sln`. | Unit of indexing is one solution or `.csproj`. Whole-repo indexing is optional and later. |
+| **1,139 projects**, mostly library plus tests, snippets, tooling. | `--include`/`--exclude` filters with **exact or glob matching** (see finding F10). Default to library projects. |
+| **Multi-targeting:** 704 projects are `net8.0;net462`, 352 are `netstandard2.0;net462`. | One TFM is analyzed per project. Pick one (prefer `net8.0`, else `netstandard2.0`), record it, and make sure the other TFM's Roslyn project is **not** indexed as a duplicate (finding F9). |
+| SDK-style projects, central package management, `global.json` pins SDK **8.0.426**. | 8.0.426 is now installed on this machine. The loader must register an MSBuild that satisfies the pin (finding F11). `dotnet restore` stays a user-run precondition. |
+| **Lots of generated code** (gRPC `*Grpc.cs`, `*.g.cs`, `<auto-generated>`), with hand-written partial classes on top (for example `*Client.Partial.cs`). | `is_generated` on files and symbols; partial classes must work (finding F3). Queries exclude generated code by default. |
+| Two code flavors: gRPC clients and REST wrappers over `Google.Apis.*`. | Nothing special in the indexer: both are ordinary class hierarchies and calls. They exercise inheritance, partials, generics, and external references heavily. |
+| Cross-API project references (Storage pulls in PubSub, Gax). | Referenced projects outside the target API's folder are `is_external` and indexed shallowly or not at all. |
 
-Start with two representative packages as the test targets: **`Google.Cloud.Storage.V1`** (REST wrapper)
-and **one gRPC package** (for example `Google.Cloud.Speech.V1`), then scale up.
+Test targets: **`Google.Cloud.Storage.V1`** and **`Google.Cloud.Speech.V1`**.
 
 ---
 
-## 2. Key decisions (proposed, please confirm or change)
+## 2. Key decisions
 
-| Topic | Proposal | Why |
+| Topic | Decision | Why |
 |---|---|---|
-| Runtime | Latest supported .NET (console app, `dotnet tool` packaging later) | Matches the rest of the stack; easy to run from PowerShell |
-| Analysis | Roslyn (`Microsoft.CodeAnalysis.CSharp.Workspaces`) with `MSBuildWorkspace` and `Microsoft.Build.Locator` | Full semantic model, so references resolve correctly, not just text matches |
-| Storage | SQLite via `Microsoft.Data.Sqlite`, with FTS5 for text search | Single file, zero setup, fast, easy to inspect |
-| Interface | CLI with subcommands; **JSON output by default for Frank**, a `--format table` option for humans | Frank parses JSON cheaply |
-| Index location | **Decided:** one database **per indexed solution/project**, stored **outside the SDK fork**, for example `E:\Dev\demos\g-api\.codeindex\storage-v1.db`, selected with `--db <path>` (default: `.codeindex\<solution-name>.db` under a directory the user configures). The `.codeindex\` folder and `*.db` files are **git-ignored** wherever they live. The fork is never modified by indexing. | Keeps it local and disposable; avoids polluting a forked repo |
-| Restore | **Decided:** `dotnet restore` is a **precondition run by the user (or Frank), not by the indexer**. The indexer checks for restore output (`obj\project.assets.json`) per project and reports a clear diagnostic naming the project and the exact restore command when it's missing. | Keeps the tool read-only and predictable |
-| Staleness | Per-file content hash recorded; queries warn if files changed since indexing | Frank never silently trusts an outdated index |
-| Tests | xUnit, with small fixture solutions checked in | Matches the user's testing standard |
+| Runtime | .NET console app, later `dotnet tool` | Matches the stack; runs from PowerShell |
+| Analysis | Roslyn `MSBuildWorkspace` + `Microsoft.Build.Locator` | Full semantic model |
+| Storage | SQLite (`Microsoft.Data.Sqlite`) with FTS5 | Single file, zero setup, easy to inspect |
+| Interface | CLI subcommands, JSON by default, `--format table` for humans | Cheap for agents to parse |
+| Index location | One database **per solution/project**, outside the SDK fork, selected by `--db` or `--solution` via a catalog. `.codeindex\` and `*.db` git-ignored. | Disposable; never modifies the code under analysis |
+| Restore | Precondition run by the user; the indexer detects missing `obj\project.assets.json` and says how to fix it | Keeps the tool read-only |
+| **Symbol identity (new)** | Every symbol has a stable `key` = `<assembly name>\|<Roslyn documentation-comment ID>` (for example `SimpleLib\|M:SimpleLib.Calculator.Add(System.Int32,System.Int32)`). The key is unique in the database. All internal links use integer ids; all external references use the key. | Names are not identity: overloads, generics, and same-named types collide on name strings |
+| **Multiple locations (new)** | A symbol has 1..n rows in `symbol_locations` (partial classes, partial methods). | Partial classes are central to the Google SDK |
+| **Rebuild semantics (new)** | `index` writes a fresh database each run (build to a temp file, then replace). Incremental updates arrive in Phase F. | Re-running currently duplicates every row (finding F2) |
+| **Query selectors (new)** | Every symbol-taking command accepts one of: `--id N`, `--key K`, `file:line:col`, or a name. A name matching several symbols returns a **candidates list** (with ids and keys), never an arbitrary first hit. | Agents must be able to disambiguate |
+| Paths | Stored and emitted relative to the repo root with `/` separators | Portable, stable for agents |
+| Staleness | Per-file content hash recorded; every query compares and sets `stale` | An outdated index must never be trusted silently |
+| Tests | xUnit, with a rich fixture solution and tests that assert real results | The current fixture cannot exercise most hard cases (finding F12) |
 
-Naming is a placeholder: working name **`codeindex`**. Rename freely.
+Naming is a placeholder: working name **`codeindex`**.
 
 ---
 
 ## 3. Architecture
 
 ```
- solution/projects ──► Loader (MSBuildWorkspace) ──► Extractors ──► Writer ──► SQLite index.db
-                                                                                  │
- Frank ──► CLI query commands ──► Query layer (SQL + FTS5) ──► JSON ◄─────────────┘
+ solution/projects ──► Loader ──► Extractors ──► Writer ──► SQLite index.db
+                                                                │
+ Agent ──► CLI query commands ──► Query layer (SQL + FTS5) ──► JSON
 ```
 
-- **Loader:** opens a `.sln`/`.slnx`/`.csproj`, resolves compilations, and reports load failures as diagnostics.
-- **Extractors:** walk each document's syntax tree plus semantic model and emit rows: symbols, references,
-  edges, and "remote operation" findings. Each extractor is a separate class so extractors can be added
-  later without touching the loader.
-- **Writer:** batches inserts in transactions, handles incremental updates (delete and reinsert rows
-  per changed file).
-- **Query layer:** parameterized SQL plus FTS5, returning compact DTOs that the CLI serializes.
-- **CLI:** thin layer; no logic beyond argument parsing and output formatting.
+- **Loader:** opens a `.sln`/`.slnx`/`.csproj`, selects one Roslyn project per project file (one TFM),
+  reports load failures as diagnostics.
+- **Extractors:** `SymbolExtractor` (declarations, one pass over `INamedTypeSymbol`/members per assembly,
+  not per syntax node) and `ReferenceExtractor` (walks every identifier/name node in each syntax tree,
+  resolves it, attributes it to the enclosing member). Each is a separate class.
+- **Writer:** bulk inserts with prepared, reused commands inside one transaction.
+- **Query layer:** parameterized SQL plus FTS5, returning compact DTOs.
+- **CLI:** thin layer over the query layer.
+- **Optional later:** a long-lived `serve` mode (JSON over stdio) to avoid per-call process startup, if
+  agent usage shows it matters. The query layer is already a library, so this is a thin addition.
 
-Suggested projects: `CodeIndexer.Core` (loader, extractors, writer, queries), `CodeIndexer.Cli`
-(commands), `CodeIndexer.Tests` (xUnit).
+Projects: `CodeIndexer.Core`, `CodeIndexer.Cli`, `CodeIndexer.Tests`.
 
 ---
 
-## 4. Proposed schema (first cut)
+## 4. Schema (revision 3)
 
-Evolve this in phases; every change to the schema bumps a `schema_version` in a `meta` table.
+Every schema change bumps `schema_version` in `meta`.
 
 | Table | Purpose | Key columns |
 |---|---|---|
-| `meta` | Schema version, index time, tool version, repo root, git commit of the indexed repo | key, value |
-| `solutions` | The solution(s) this database was built from (normally exactly one; the table exists so the model never assumes it) | id, name (for example `Google.Cloud.Storage.V1`), path (relative to repo root), indexed_at |
-| `solution_projects` | Many-to-many link: a project can belong to several solutions | solution_id, project_id |
-| `projects` | One row per project | id, name, path (relative to repo root), target_frameworks, indexed_tfm, language, `is_external` (true for projects pulled in from other APIs or shared libraries, such as `Google.Cloud.PubSub.V1` referenced from the Storage solution; their symbols are indexed shallowly or not at all) |
-| `files` | One row per source file | id, project_id, path, content_hash, line_count |
-| `symbols` | Types and members | id, file_id, kind, name, full_name, container_id, signature, accessibility, start_line, end_line, doc_summary |
-| `symbol_references` | Every resolved use of a symbol | symbol_id, file_id, line, column, kind |
-| `edges` | Typed relationships | from_symbol_id, to_symbol_id, kind (`inherits`, `implements`, `calls`, `overrides`, `creates`) |
-| `remote_ops` | Detected remote operations | file_id, symbol_id (enclosing member), line, protocol, http_method, url_or_path, evidence |
-| `config_refs` | Base URLs, endpoint settings, env-var reads | file_id, line, key, value_hint |
-| `diagnostics` | Load/index problems | severity, message, project_id, file_id |
-| `symbols_fts` | FTS5 over names, signatures, and doc summaries | (virtual table) |
+| `meta` | Schema version, index time, tool version, repo root, git commit | key, value |
+| `solutions`, `solution_projects` | The solution(s) this database was built from | as before |
+| `projects` | One row per project | id, name, path (**UNIQUE**), target_frameworks, indexed_tfm, language, is_external |
+| `files` | One row per source file | id, project_id, path (**UNIQUE with project_id**), content_hash, line_count, is_generated |
+| `symbols` | Types, members, **and external stubs** | id, **key (UNIQUE)**, kind, name, full_name, container_id (**populated**), signature, accessibility, doc_summary, is_generated, **is_external**, assembly |
+| `symbol_locations` | Where a symbol is declared | symbol_id, file_id, start_line, start_col, end_line, end_col, is_primary |
+| `symbol_references` | Every resolved use of a symbol | symbol_id, file_id, line, col, kind, **enclosing_symbol_id** |
+| `edges` | Typed relationships | from_symbol_id, to_symbol_id, kind (`inherits`, `implements`, `overrides`, `creates`, `calls`) |
+| `diagnostics` | Load and index problems (**actually written**) | severity, message, project_id, file_id |
+| `symbols_fts` | FTS5 over names, signatures, docs | external-content table, rebuilt with the `'rebuild'` command |
 
-**Solution awareness across many databases.** Because the Google SDK has one solution per API (356 of them),
-two layers keep the tool always aware of which solution it is looking at:
+Reference kinds: `call`, `read`, `write`, `type-use`, `create`, `override`, `inherit`, `implement`,
+`attribute`, `nameof/typeof`.
 
-1. **Inside a database:** every query result includes a `solution` field (name and relative path) and
-   the indexed commit, so Frank never has to guess which solution an answer came from. Paths stored in the
-   database are relative to the repo root, which keeps databases portable and comparable.
-2. **A small catalog database** (`catalog.db`, in the same index directory) lists every database that has
-   been built: solution name, relative solution path, database path, indexed commit, indexed time, and
-   staleness. Commands: `codeindex list` (what's indexed), `codeindex resolve <name-or-path>` (which database
-   answers questions about this API or file), and `--solution <name>` on query commands so Frank can say
-   `--solution Google.Cloud.Storage.V1` instead of juggling `--db` paths. Querying a file path that belongs
-   to an API with no database should return a clear "not indexed; run `codeindex index <solution>`" message.
+Indexes: unique keys above, plus `symbols(name)`, `symbols(full_name)`, `symbol_references(symbol_id)`,
+`symbol_references(file_id, line)`, `symbol_references(enclosing_symbol_id)`, `edges` both directions,
+`symbol_locations(file_id, start_line)`.
 
-Indexes: `symbols(name)`, `symbols(full_name)`, `references(symbol_id)`, `edges(from_symbol_id)`,
-`edges(to_symbol_id)`, and `files(path)`.
+**Solution awareness across databases** stays as designed: every response carries solution name, path, and
+indexed commit; a `catalog.db` lists every built database; `list`, `resolve`, and `--solution <name>`
+select the right one.
 
 ---
 
 ## 5. Phases
 
-Each phase ends with something usable and tested. Check items off as you go.
+Each phase ends with something usable and tested. Check items off as work completes.
 
-### Phase 0: Foundations
-**Outcome:** a solution that builds, runs, and loads a real .NET solution.
-- [x] Create the solution: Core, Cli, Tests projects; set up git ignore for `.codeindex\`.
-- [x] Register MSBuild with `Microsoft.Build.Locator` before any Roslyn workspace use.
-- [x] Load a sample solution with `MSBuildWorkspace`; print project and document counts.
-- [x] Capture workspace load failures into a diagnostics list (never swallow them).
-- [ ] Prove loading on `apis\Google.Cloud.Storage.V1\Google.Cloud.Storage.V1.sln` and one gRPC package
-      (for example `Google.Cloud.Speech.V1`), using the SDK pinned in the repo's `global.json` (8.0.426).
-- [x] Choose the **primary TFM per project** (prefer `net10.0`, else `net8.0`, else `netstandard2.0`) and record it.
-- [x] Add project include/exclude filters (default: skip tests, snippets, benchmarking, clean-test-data projects).
-- [x] Decide how restore is handled (see Risks); confirm packages restore for the two target packages.
-- [x] Add a tiny fixture solution under `tests\Fixtures\` for later phases.
+### Phase 0: Foundations (done, with one gap)
+- [x] Solution layout (Core, Cli, Tests), git ignore for `.codeindex\` and `*.db`.
+- [x] MSBuild registration, workspace load, diagnostics capture, project filters, fixture solution.
+- [ ] Prove loading on `Google.Cloud.Storage.V1.sln` and `Google.Cloud.Speech.V1` (moved to Phase E).
 
-### Phase 1: Index symbols into SQLite
-**Outcome:** `codeindex index <sln>` produces a database of types and members.
-- [x] Schema creation and `schema_version` handling, including `solutions`, `solution_projects`, and
-      `projects.is_external` (see section 4).
-- [x] Create or update the catalog database entry whenever an index is built; implement `list` and `resolve`.
-- [x] Every query result carries the `solution` name/path and indexed commit.
-- [x] Extract projects, files (with content hash), and symbols (namespaces, types, methods, properties,
-      fields, events) with signatures, accessibility, line ranges, and XML doc summary.
-- [x] Add `is_generated` to `files` and `symbols` (auto-generated header, `[GeneratedCode]`, `.g.cs`, `*Grpc.cs`),
-      and record the indexed target framework on `projects`.
-- [x] Batched transactional writer; WAL mode.
-- [x] Add FTS5 table and populate it.
-- [x] CLI: `index`, `info` (index stats, staleness, diagnostics).
-- [x] Tests: fixture solution produces the expected symbol rows.
+### Phase A: Stabilize identity, storage, and loading (done 2026-10-24)
+**Outcome:** a database that is correct and repeatable, before any extractor work. 83 tests pass.
+- [x] **F1** `symbols.key` (assembly + documentation-comment ID), unique; the extractors' symbol map is keyed
+      on it, so overloads are distinct and generic instantiations resolve to their definition.
+      (Name-based lookups in the query layer still pick the first match; Phase D replaces them.)
+- [x] **F2** `index` builds a temp file and atomically replaces the database (a failed run leaves the old one by construction; no test covers that path yet).
+      Unique constraints on `projects.path` and `files(project_id, path)`; schema version 3. Test: indexing
+      twice yields identical row counts and one solution/project row.
+- [x] **F9** Loader keeps exactly one Roslyn project per project file (primary TFM) and records an Info
+      diagnostic. Verified with a new multi-targeted fixture (`tests\Fixtures\MultiTarget`) using
+      `#if NET10_0` to prove which TFM was analyzed. Still to confirm on the real Google solutions (Phase E).
+- [x] **F10** Project filter matches whole names; `*`/`?` wildcards; default exclusions are patterns such as
+      `*.Tests` and `*.Snippets`, so `Contest.Core` is no longer dropped.
+- [x] **F11** The loader reads the governing `global.json` and registers a matching SDK per its `rollForward`
+      policy, failing with a clear message when none is installed. Unit-tested in `SdkSelector`; not yet
+      exercised end-to-end against the Google fork's `global.json` (Phase E).
+- [x] **F13** Diagnostics are written to the `diagnostics` table (solution-level and per project) and shown
+      by `info`.
+- [x] **F14** Git commit comes from `git rev-parse HEAD`; the CLI also finds repo roots where `.git` is a file.
+- [x] **F15** Stored and emitted paths are repo-relative with `/` (including `repo_root`); `outline` accepts
+      either separator. `stale` is still never computed (Phase D).
+- [x] **F16** Prepared, reused insert commands with `RETURNING id`; FTS uses the `'rebuild'` command.
+      (Speed not yet measured; that is Phase E.)
+- [x] Primary TFM rule: highest modern `netN.M` (N >= 5), else highest `netstandard`, else `netcoreapp`,
+      else the first declared. `net462` is only chosen when nothing else exists.
+- [x] Also fixed, because the unique key made them crash-or-duplicate: nested types are no longer emitted
+      twice (F4), and a partial type's members are attributed to the part that declares them (part of F3).
+      The full partial-class model (one symbol, many locations) is still Phase C.
+- Fixture tests restore the fixture solutions on first use, since `obj\` is git-ignored.
 
-### Phase 2: Navigation queries (Frank's core tools)
-**Outcome:** Frank can explore a codebase through short, structured answers.
-- [x] `find-symbol <name>` (exact, prefix, and FTS match; filter by kind/project). Excludes generated
-      code by default; `--include-generated` opts in.
-- [x] `outline <file or type>` (members of a type or file, with signatures and line numbers).
-- [x] `show <symbol>` (definition location, signature, doc summary, and optionally the source lines).
-- [x] `search <text>` (FTS over names, signatures, and docs).
-- [x] JSON output contract documented in `docs\code-indexer-output-contract.md`; `--format table` for humans.
-- [x] Result limits and truncation flags on every command, so output stays small by default.
-- [x] Tests for each command against the fixture.
+### Phase B: A fixture that can actually fail
+**Outcome:** tests that exercise the hard cases with real assertions (today's tests mostly assert
+`NotNull`).
+- [ ] Fixture solution `tests\Fixtures\Semantics\` covering: overloaded methods, generic types and generic
+      methods, extension methods, partial classes split across files (one generated), partial methods,
+      nested types, interface implementation (implicit and explicit), abstract/virtual/override chains,
+      records, structs, enums, delegates and events, properties, fields with initializers, constructor
+      chains (`this(...)`/`base(...)`), lambdas and local functions, object creation (including target-typed
+      `new()`), `nameof`/`typeof`/attributes, a multi-targeted project, and calls into external code
+      (`HttpClient`, `List<T>`, LINQ).
+- [ ] Golden expectations written by hand for: who calls each overload, who references each type, who
+      implements what, the call graph through an interface, and the symbol/location counts.
+- [ ] Tests assert exact results (counts, ids resolved by key, line numbers), not just non-null.
+- [ ] Tests for idempotent re-index, path normalization, and the filter semantics.
 
-### Phase 3: References and relationships
-**Outcome:** answers "who uses this?" and "what does this use?".
-- [x] Extract resolved references (semantic model walk); store in `symbol_references`.
-- [x] Extract `edges`: inheritance, interface implementation, overrides, object creation.
-- [x] Extract call edges (method invocation resolved to its target symbol), including interface dispatch noted as such.
-- [x] CLI: `refs <symbol>`, `callers <symbol> [--depth n]`, `callees <symbol> [--depth n]`,
-      `implementations <interface>`, `hierarchy <type>`.
-- [x] Depth limits and cycle protection on graph traversals.
-- [x] Tests, including interface/override cases.
+### Phase C: Extraction rewrite
+**Outcome:** the index answers references and call hierarchy correctly.
+- [ ] **Declarations:** walk symbols rather than syntax nodes: namespaces (as containers), types, members,
+      accessors as part of their property, delegates, events, operators, indexers, finalizers. Set
+      `container_id`. One row per symbol with n `symbol_locations` (fixes F3 partials and F4 duplicate
+      nested types).
+- [ ] **References:** visit every name node (identifiers, generic names, qualified names) in every
+      document, resolve via the semantic model (`OriginalDefinition` for generics and reduced extension
+      methods, candidate symbols when overload resolution is ambiguous), and record kind and
+      `enclosing_symbol_id`. This covers property accessors, field initializers, attributes, base lists,
+      `typeof`/`nameof`, and type-use in signatures (fixes F5).
+- [ ] **Edges:** `inherits`, `implements` (type and member level), `overrides` (methods, properties,
+      events), `creates` (to the constructor, including implicit/target-typed `new`), `calls`
+      (member-to-member).
+- [ ] **Interface dispatch (F6):** a call to an interface or abstract/virtual member records the edge to that
+      member; `implements`/`overrides` member edges let queries expand it to concrete targets.
+- [ ] **External symbols (F8):** when a resolved symbol is declared outside the indexed projects, insert (or
+      reuse) a stub `symbols` row with `is_external = 1`, its key, kind, full name, and assembly, so
+      references and calls to it are stored.
+- [ ] Generated-file detection: `*Grpc.cs`, `*.g.cs`, `*.Designer.cs`, `<auto-generated>`,
+      `[GeneratedCode]` (fixes the `.Grpc.cs` pattern).
+- [ ] Bounded memory: one project's compilation at a time; no sync-over-async (`.Result`).
 
-### Phase 4: Remote-operation detection (the SDK-specific value)
-**Outcome:** Frank can list every remote call an SDK makes, as input to the mock plan.
-- [ ] Detect usage of `HttpClient`/`HttpRequestMessage` (verbs, URL/path literals, string-interpolation templates).
-- [ ] **gRPC detector** (priority for the Google SDK): generated `*Client` stubs and `*Grpc.cs` service
-      descriptors; list each RPC method with its request/response types and streaming kind; map the
-      hand-written client wrapper methods (for example `SpeechClient.Recognize`) to their RPCs.
-- [ ] **REST detector** (Google.Apis-based packages such as Storage): `Google.Apis.*` request classes,
-      HTTP verb and path template (for example from `ClientServiceRequest` subclasses), and the
-      hand-written wrapper methods that call them.
-- [ ] Later detectors by priority: `WebClient`/`HttpWebRequest`, SOAP/WCF proxies, `RestSharp`-style libraries.
-- [ ] Detect base-address/endpoint configuration points (the "redirect seam" Frank needs), such as
-      `BaseAddress`, options classes with `Endpoint`/`BaseUrl`, and environment-variable reads. For the
-      Google SDK, expect seams in builders (`*ClientBuilder.Endpoint`), `Google.Api.Gax` settings,
-      credential/channel configuration, and emulator-host environment variables (for example
-      `STORAGE_EMULATOR_HOST`); verify against the real code.
-- [ ] Detect auth/token flows (token endpoints, `Authorization` header construction, OAuth client usage).
-- [ ] Store each finding with the enclosing member and an `evidence` snippet and confidence value.
-- [ ] CLI: `remote-ops [--project p] [--public-api-only]` and `seams` (list redirect-seam candidates).
-- [ ] Output shaped so it maps directly to Frank's **SDK call → remote operation → mock workflow** table.
-- [ ] Tests with fixtures covering each detector, including false-positive cases.
+### Phase D: Query layer and CLI
+**Outcome:** commands an agent can chain without ambiguity.
+- [ ] Symbol selectors (`--id`, `--key`, `file:line:col`, name) on every symbol-taking command; ambiguous
+      names return candidates with ids and keys and a warning. Every symbol payload includes `id` and `key`.
+- [ ] `definition` and a position lookup `at <file>:<line>:<col>` (the symbol under a position).
+- [ ] `refs`: filter by reference kind and by file/project, optional one-line source context, grouped
+      output option.
+- [ ] `callers`/`callees`: include call-site file/line, `--depth` (fix: `0` currently returns nothing though
+      help says "no limit"), `truncated` flag, and `--through-dispatch` to expand interface/virtual calls.
+- [ ] `implementations` for interfaces, abstract/virtual members, and base classes; `hierarchy` with
+      explicit supertype/subtype directions.
+- [ ] `outline` for a type or file, ordered and nested by `container_id`.
+- [ ] Compute `stale` from content hashes on every query (today it is never set); list changed files.
+- [ ] Update `docs\code-indexer-output-contract.md` to cover all commands (Phase 3 commands are missing),
+      the new `id`/`key` fields, and the candidates shape. `--format table` actually implemented (the
+      option is currently accepted and ignored).
+- [ ] Tests for each command against the Phase B fixture.
 
-### Phase 5: Incremental indexing and freshness
-**Outcome:** fast re-runs; Frank always knows if the index is stale.
-- [ ] Compare file hashes; reindex only changed files and their dependents (document the dependency rule).
-- [ ] Handle deleted/renamed files and project-file changes (full reindex of affected projects).
-- [ ] Staleness check on every query (cheap hash/mtime check); emit a `stale: true` warning in output.
-- [ ] `codeindex index --watch` is optional and can be deferred.
-- [ ] Tests: edit, add, and delete files, then verify the index matches a clean rebuild.
+### Phase E: Prove it on real code
+**Outcome:** reliable and fast on the reference SDK.
+- [ ] Index `Google.Cloud.Storage.V1.sln` and `Google.Cloud.Speech.V1` with the pinned SDK 8.0.426;
+      spot-check 20 known symbols for correct definition, references, and callers against the IDE.
+- [ ] Verify multi-TFM handling and generated-code flags on real files.
+- [ ] Benchmarks and targets (for example full index of one API in minutes, any query under 100 ms);
+      tune SQLite pragmas, batching, indexes.
+- [ ] Partial results with diagnostics when some projects fail to load.
 
-### Phase 6: Hardening, packaging, and performance
-**Outcome:** reliable on real, large codebases; easy to install.
-- [ ] Benchmark on a large solution; set targets (for example, full index in minutes, any query under 100 ms).
-- [ ] Tune SQLite (indexes, pragmas, batch sizes); add `codeindex vacuum`/`reset`.
-- [ ] Robust error handling: partial results with diagnostics when some projects fail to load.
-- [ ] Package as a `dotnet tool` (`dotnet tool install --local`) so Frank can run `dotnet codeindex ...`.
-- [ ] README with PowerShell examples; `--help` text tuned for LLM use (clear, short, consistent).
+### Phase F: Incremental indexing and freshness
+- [ ] Hash comparison; reindex changed files and their dependents (document the dependency rule).
+- [ ] Deleted/renamed files and project-file changes (reindex affected projects).
+- [ ] Tests: edit/add/delete, then compare with a clean rebuild.
+- [ ] `--watch` optional and deferrable.
+
+### Phase G: Packaging and agent ergonomics
+- [ ] `dotnet tool` packaging; README with PowerShell examples; consistent, short `--help` text.
+- [ ] Decide on a `serve` mode (stdio JSON) and/or an MCP wrapper.
 - [ ] CI workflow running the xUnit suite.
 
-### Phase 7: Frank integration
-**Outcome:** Frank prefers the indexer for .NET code navigation.
-- [ ] Add the indexer to Frank's **Tools** section as the preferred way to navigate .NET code, with the
-      rule: index first (or check freshness), query before reading files, then open only the files needed.
-- [ ] Add learnings in `.cursor\learnings\` describing the commands, typical workflows (for example,
-      "find all remote operations in an SDK"), and gotchas discovered during development.
-- [ ] Define the fallback: if the index is missing or stale, or the code isn't .NET, Frank falls back to reading files.
-- [ ] Trial run: have Frank review one real SDK using only the indexer plus targeted file reads; record what was missing.
-
 ### Later ideas (parked)
-- Multi-solution or multi-repo index; NuGet dependency metadata; SDK public-API surface diff between versions.
-- Roslyn analyzers-style checks (missing timeouts, swallowed exceptions) feeding Frank's "surprises" list.
-- Export of the remote-operation list straight into n8n workflow skeletons.
+- Multi-solution or multi-repo index; NuGet dependency metadata; public-API surface diff between versions.
+- Analyzer-style queries (for example missing timeouts) built on the same index.
+
+### Consumer-layer ideas (not part of this tool)
+Because external symbols are indexed, a consumer can build domain features from ordinary queries, for
+example "list every call site of `System.Net.Http.HttpClient` members" or "find subclasses of a gRPC client
+base type". Such logic belongs in the consumer's own tooling or an optional separate package, not in the
+core indexer.
 
 ---
 
@@ -236,26 +273,56 @@ Each phase ends with something usable and tested. Check items off as you go.
 
 | Risk or question | Notes and mitigation |
 |---|---|
-| **.NET Framework / old-style csproj loading** | Lower risk for the Google SDK, since its projects are SDK-style and multi-target `net462` alongside `net8.0`/`netstandard2.0`. Index the modern TFM. Truly old-style (non-SDK) csproj files in other codebases may need Visual Studio's MSBuild; a syntax-only fallback mode (reduced accuracy) is the plan B. |
-| **Cross-API project references** | Observed 2026-10-24: restoring the Storage solution also restored `Google.Cloud.PubSub.V1`, so one API's solution can pull in projects from another API folder (and the Gax/shared projects). Loading a solution may therefore bring in more than its own folder; scope indexing to the target API's projects by default and treat referenced projects as external. |
-| **Multi-targeting** | Only one TFM is analyzed per project. Code under `#if NET462` is invisible when indexing `net8.0`. Record the indexed TFM and surface it in `info`. |
-| **Pinned SDK (8.0.426)** | `global.json` pins .NET SDK 8.0.426 (`rollForward: latestMinor`). `Microsoft.Build.Locator` must register an MSBuild that satisfies it; document the install requirement and fail with a clear message if missing. **Current machine (2026-10-24):** only 8.0.132 is installed in the 8.0 band (plus 9.0.205 and 10.0.301), so `dotnet` commands inside the fork fail with "A compatible .NET SDK was not found". Install 8.0.426 (or newer 8.0.x) before Phase 0 restore/loading works. |
-| **Restore required** | **Decided:** restore is a precondition (see Key decisions). Semantic analysis needs restored NuGet packages; the indexer only detects missing `project.assets.json` and says how to fix it. |
-| **Repo scale** | 356 solutions and 1,139 projects. Never default to indexing everything. Index per API, on demand; consider a batch mode and a combined catalog later. |
-| **Source generators** | Generated code may be missing or incomplete if the project hasn't been built. Document the limitation. (The Google SDK checks in its generated sources, which helps.) |
-| **Heuristic remote-op detection** | Will produce false positives and misses. Store a `confidence` value and the `evidence`, and tell Frank to verify findings by reading the cited lines. |
-| **Large solutions** | Memory and time. Process project by project; keep compilations short-lived. |
-| **Index trust** | An outdated index misleads Frank. Hashing and staleness warnings are mandatory, not optional. |
-| ~~Which SDKs first?~~ | **Answered:** the Google Cloud .NET SDK fork at `E:\Dev\demos\g-api\google-cloud-dotnet`. Start with `Google.Cloud.Storage.V1` (REST) and one gRPC package (for example `Google.Cloud.Speech.V1`). |
-| **Open question: other SDKs after Google?** | Determines how much effort goes into the old-style csproj fallback. |
-| **Open question: tool name and repo** | Placeholder `codeindex`. Decide whether it lives in this repo or its own. |
+| **Old-style (non-SDK) csproj** | Lower risk for the reference SDK. A syntax-only fallback is plan B for other codebases. |
+| **Multi-targeting** | Only one TFM is analyzed; code under `#if NET462` is invisible. Record the TFM and show it in `info`. Needs the F9 fix. |
+| **Cross-API project references** | A solution can pull in projects from other API folders; treat them as external and keep them shallow. |
+| **Pinned SDK** | `global.json` pins 8.0.426 (now installed here). The loader must honor it (F11). |
+| **Restore required** | Detect missing `project.assets.json` per project, report the exact restore command. |
+| **Source generators** | Generated code can be missing if a project hasn't been built; document. (The Google SDK checks in generated sources.) |
+| **Large solutions** | Process project by project, short-lived compilations; measure in Phase E. |
+| **Index trust** | Hash-based `stale` flag is mandatory (Phase D), not optional. |
+| **External symbol volume** | Indexing every referenced framework symbol adds rows. Mitigate by inserting stubs only for symbols actually referenced, and measure. |
+| **Open: other SDKs after Google?** | Decides how much to invest in the non-SDK csproj fallback. |
+| **Open: tool name and repo** | Placeholder `codeindex`. Decide whether it lives in this repo or its own. |
+| **Open: `serve` mode vs per-call CLI** | Decide after measuring process-startup cost in Phase E. |
 
 ---
 
-## 7. Definition of done (overall)
+## 7. Review findings baseline (2026-10-24)
 
-- Frank can, from PowerShell, index a .NET solution and answer symbol, reference, call, and
-  remote-operation questions with small JSON outputs.
-- The index is incremental, staleness-aware, and safe to delete and rebuild at any time.
-- Tests (xUnit) cover each extractor and query against fixture solutions.
-- Frank's persona and learnings reference the tool as the preferred navigation method.
+Status key: **Confirmed** = reproduced by running the tool; **Read** = found in the code, not yet reproduced.
+Tests: 42/42 pass, but the fixture is a single 54-line file with no in-project calls.
+
+| ID | Finding | Status | Fixed in |
+|---|---|---|---|
+| F1 | Symbols are keyed by `ContainingType.Name` strings (no parameters or generic arity), so overloads collapse in `SymbolMap` and name lookups pick an arbitrary first row | Read | Phase A (done: identity); C |
+| F2 | Re-running `index` on the same database duplicates everything (2 solutions, 2 projects, 28 symbols after two runs on a 14-symbol fixture; `find-symbol` returns each hit twice). No unique constraints behind `INSERT OR IGNORE` | **Confirmed** | Phase A (done) |
+| F3 | Partial classes: members come from `GetMembers()` (all parts) and are attributed to every part's file with the first part's lines | Read | Phase C (A: members now attributed to their own part) |
+| F4 | Nested types are inserted twice (as members and by the type walk) | Read | Phase A (done) |
+| F5 | References cover only method/constructor bodies via `a.b` and invocations; no type usages, accessors, initializers, attributes, bare identifiers. `refs Calculator` returned nothing on the fixture | **Confirmed** (types), Read (rest) | Phase C |
+| F6 | Calls through an interface are not linked to implementations; callers of an implementation miss interface calls | Read | Phase C/D |
+| F7 | Generic method calls and ambiguous overload resolution are not handled (`GetSymbolInfo(...).Symbol` only) | Read | Phase C |
+| F8 | References to symbols outside the index are discarded (`SymbolId > 0` filter) | Read | Phase C |
+| F9 | Loader reads the TFM from XML but does not filter Roslyn projects; multi-targeted projects may be indexed once per TFM under the same path | Read (verify on Google) | Phase A (done); verify on Google in E |
+| F10 | Project filter uses substring matching: `Include("SimpleLib")` also matches `SimpleLib.Tests`; default exclude `test` matches any name containing it | Read | Phase A (done) |
+| F11 | `RegisterMsBuild` picks the highest MSBuild instance, ignoring `global.json` | Read | Phase A (done; unit-tested, verify on Google in E) |
+| F12 | Call/refs/callers tests assert only `NotNull`; fixture has no resolved in-project calls, so call edges and caller queries are effectively untested (confirmed: `callers`, `callees`, `refs` all return empty on the fixture) | **Confirmed** | Phase B |
+| F13 | `diagnostics` table exists but is never written | Read | Phase A (done) |
+| F14 | Git commit read by parsing `.git/HEAD` (breaks with worktrees/packed refs) | Read | Phase A (done) |
+| F15 | Emitted paths use `\` separators on Windows; `stale` is always `false` because it is never computed | **Confirmed** | Phase A (done: paths); D (`stale`) |
+| F16 | Per-row uncached commands; FTS rebuilt with `INSERT OR REPLACE` into an external-content table | Read | Phase A (done; measure in E) |
+| F17 | `container_id` is never set; namespaces and delegates are not indexed though the contract lists `namespace` | Read | Phase C |
+| F18 | `callers --depth 0` returns nothing although help says "0 = no limit"; `callers`/`callees` never set `truncated` | Read | Phase D |
+| F19 | `--format` is accepted but ignored on every command | Read | Phase D |
+| F20 | `IsGeneratedFilePath` matches `.Grpc.cs`; the Google files are named like `SpeechGrpc.cs` | Read | Phase C |
+
+---
+
+## 8. Definition of done (overall)
+
+- An agent can, from PowerShell, index a .NET solution and get correct answers for definition, references,
+  implementations, callers/callees (including through interfaces), and hierarchy, with small JSON output
+  and unambiguous symbol selectors.
+- The index is repeatable, staleness-aware, incremental, and safe to delete and rebuild at any time.
+- Tests (xUnit) with a rich fixture assert exact results for each extractor and query.
+- Verified on `Google.Cloud.Storage.V1` and `Google.Cloud.Speech.V1`.

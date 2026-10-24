@@ -161,7 +161,7 @@ public sealed class SymbolQueries : IDisposable
             LEFT JOIN symbols s ON s.file_id = f.id
             WHERE f.path LIKE @path
             ORDER BY s.start_line";
-        cmd.Parameters.AddWithValue("@path", $"%{filePath}%");
+        cmd.Parameters.AddWithValue("@path", $"%{PathUtil.Normalize(filePath)}%");
 
         var symbols = new List<SymbolResult>();
         string resolvedPath = "";

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using CodeIndexer.Core.Loading;
 using CodeIndexer.Core.Models;
 using CodeIndexer.Core.Storage;
@@ -10,52 +11,108 @@ public sealed class IndexEngine
     private readonly string _repoRoot;
     public IndexEngine(string repoRoot) => _repoRoot = repoRoot;
 
+    /// <summary>
+    /// Builds a fresh index database. The database is written to a temporary file and then moved over
+    /// <paramref name="dbPath"/>, so re-running never accumulates rows from an earlier run and a failed run
+    /// leaves the previous database untouched.
+    /// </summary>
     public async Task<IndexResult> IndexSolutionAsync(string dbPath, SolutionLoadResult loadResult)
     {
         var result = new IndexResult();
-        using var db = new IndexDatabase(dbPath, _repoRoot);
+        var fullDbPath = Path.GetFullPath(dbPath);
+        var tempPath = fullDbPath + ".tmp";
+        Directory.CreateDirectory(Path.GetDirectoryName(fullDbPath)!);
+        DeleteDatabaseFiles(tempPath);
 
-        var solutionDir = Path.GetDirectoryName(loadResult.SolutionPath) ?? _repoRoot;
-        var repoRootDir = _repoRoot;
-
-        db.SetMeta("tool_version", "0.1.0");
-        db.SetMeta("indexed_at", DateTime.UtcNow.ToString("O"));
-        db.SetMeta("repo_root", repoRootDir);
-        db.SetMeta("git_commit", GetGitCommit(repoRootDir));
-
+        var gitCommit = GetGitCommit(_repoRoot);
+        var indexedAt = DateTime.UtcNow;
         var solutionName = Path.GetFileNameWithoutExtension(loadResult.SolutionPath);
-        var solutionRelPath = Path.GetRelativePath(repoRootDir, loadResult.SolutionPath);
+        var solutionRelPath = PathUtil.ToRepoRelative(_repoRoot, loadResult.SolutionPath);
 
-        db.BeginTransaction();
+        try
+        {
+            using (var db = new IndexDatabase(tempPath, _repoRoot))
+            {
+                db.SetMeta("tool_version", "0.1.0");
+                db.SetMeta("indexed_at", indexedAt.ToString("O"));
+                db.SetMeta("repo_root", PathUtil.Normalize(_repoRoot));
+                db.SetMeta("git_commit", gitCommit);
 
-        var solutionId = db.InsertSolution(solutionName, solutionRelPath, DateTime.UtcNow);
+                db.BeginTransaction();
+                await WriteIndexAsync(db, loadResult, solutionName, solutionRelPath, indexedAt, result);
+                db.RebuildFtsIndex();
+                db.CommitTransaction();
+                db.Checkpoint();
+            }
 
+            DeleteDatabaseFiles(fullDbPath);
+            File.Move(tempPath, fullDbPath);
+        }
+        catch
+        {
+            DeleteDatabaseFiles(tempPath);
+            throw;
+        }
+
+        UpdateCatalog(fullDbPath, solutionName, solutionRelPath, gitCommit, indexedAt);
+        return result;
+    }
+
+    private async Task WriteIndexAsync(
+        IndexDatabase db, SolutionLoadResult loadResult, string solutionName, string solutionRelPath,
+        DateTime indexedAt, IndexResult result)
+    {
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(loadResult.SolutionPath)) ?? _repoRoot;
+        var solutionId = db.InsertSolution(solutionName, solutionRelPath, indexedAt);
+
+        // Solution-level load diagnostics are not tied to a project.
+        foreach (var d in loadResult.Diagnostics)
+            db.InsertDiagnostic(d, null, null);
+
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+        var projectIds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var indexed = new List<(IndexedProject Project, long ProjectId)>();
+
+        // Pass 1: projects, files, symbols.
         foreach (var project in loadResult.IndexableProjects)
         {
             var roslynProject = project.RoslynProject!;
             var projectPath = roslynProject.FilePath ?? "";
-            var projectRelativePath = Path.GetRelativePath(repoRootDir, projectPath);
-            bool isExternal = !string.IsNullOrEmpty(projectPath) && !projectPath.StartsWith(solutionDir, StringComparison.OrdinalIgnoreCase);
+            var projectRelativePath = PathUtil.ToRepoRelative(_repoRoot, projectPath);
+            if (projectIds.ContainsKey(projectRelativePath))
+                continue;
 
-            var projectDir = Path.GetDirectoryName(projectPath);
-            var assetsPath = projectDir is not null ? Path.Combine(projectDir, "obj", "project.assets.json") : null;
-            if (assetsPath is not null && !File.Exists(assetsPath))
-            {
-                result.Diagnostics.Add(new DiagnosticEntry
-                {
-                    Severity = Models.DiagnosticSeverity.Warning,
-                    Message = $"Project '{project.Name}' not restored. Run: dotnet restore \"{projectPath}\"",
-                    ProjectPath = projectPath,
-                });
-            }
+            bool isExternal = !string.IsNullOrEmpty(projectPath) && !PathUtil.IsUnderDirectory(projectPath, solutionDir);
 
             var projectId = db.InsertProject(
                 project.Name, projectRelativePath,
                 string.Join(";", project.AllTargetFrameworks),
                 project.TargetFramework, project.Language, isExternal);
+            projectIds[projectRelativePath] = projectId;
+            indexed.Add((project, projectId));
 
             db.LinkSolutionProject(solutionId, projectId);
             result.ProjectsIndexed++;
+
+            foreach (var d in project.Diagnostics)
+                db.InsertDiagnostic(d, projectId, null);
+
+            var projectDir = Path.GetDirectoryName(projectPath);
+            var assetsPath = projectDir is not null ? Path.Combine(projectDir, "obj", "project.assets.json") : null;
+            if (assetsPath is not null && !File.Exists(assetsPath))
+            {
+                var restore = new DiagnosticEntry
+                {
+                    Severity = Models.DiagnosticSeverity.Warning,
+                    Message = $"Project '{project.Name}' not restored. Run: dotnet restore \"{projectPath}\"",
+                    ProjectPath = projectPath,
+                };
+                result.Diagnostics.Add(restore);
+                db.InsertDiagnostic(restore, projectId, null);
+            }
+
+            var compilation = await roslynProject.GetCompilationAsync();
+            var extractor = compilation is null ? null : new SymbolExtractor(compilation);
 
             foreach (var doc in roslynProject.Documents)
             {
@@ -63,31 +120,28 @@ public sealed class IndexEngine
                     continue;
 
                 var text = await doc.GetTextAsync();
-                var content = text.ToString();
-                var contentHash = IndexDatabase.ComputeContentHash(content);
-                var lineCount = text.Lines.Count;
+                var contentHash = IndexDatabase.ComputeContentHash(text.ToString());
 
                 var syntaxTree = await doc.GetSyntaxTreeAsync();
-                var fileRelPath = doc.FilePath is not null ? Path.GetRelativePath(repoRootDir, doc.FilePath) : doc.Name;
+                var fileRelPath = doc.FilePath is not null ? PathUtil.ToRepoRelative(_repoRoot, doc.FilePath) : PathUtil.Normalize(doc.Name);
                 bool isGenerated = false;
                 if (syntaxTree is not null)
                     isGenerated = SymbolExtractor.DetectGenerated(await syntaxTree.GetRootAsync());
                 if (!isGenerated)
                     isGenerated = SymbolExtractor.IsGeneratedFilePath(fileRelPath);
 
-                var fileId = db.InsertFile(projectId, fileRelPath, contentHash, lineCount, isGenerated);
+                var fileId = db.InsertFile(projectId, fileRelPath, contentHash, text.Lines.Count, isGenerated);
                 result.FilesIndexed++;
 
-                var compilation = await roslynProject.GetCompilationAsync();
-                if (compilation is null) continue;
+                if (extractor is null) continue;
 
-                var extractor = new SymbolExtractor(compilation);
-                var symbolRows = extractor.Extract(new[] { doc });
-
-                foreach (var sym in symbolRows)
+                foreach (var sym in extractor.Extract(new[] { doc }))
                 {
+                    // A partial type is declared in several documents; the first declaration owns the row.
+                    if (!seenKeys.Add(sym.Key)) continue;
+
                     sym.FileId = fileId;
-                    sym.Id = db.InsertSymbol(fileId, sym.Kind, sym.Name, sym.FullName, sym.ContainerId,
+                    sym.Id = db.InsertSymbol(fileId, sym.Key, sym.Kind, sym.Name, sym.FullName, sym.ContainerId,
                         sym.Signature, sym.Accessibility, sym.StartLine, sym.EndLine,
                         sym.DocSummary, sym.IsGenerated);
                     result.SymbolsIndexed++;
@@ -95,18 +149,14 @@ public sealed class IndexEngine
             }
         }
 
-        // Phase 3: Extract references and edges (second pass after all symbols are in the DB).
+        // Pass 2: references and edges, once every symbol has an id.
         var symbolMap = ReferenceExtractor.LoadSymbolMap(db.Connection);
 
-        foreach (var project in loadResult.IndexableProjects)
+        foreach (var (project, projId) in indexed)
         {
             var roslynProject = project.RoslynProject!;
             var projCompilation = await roslynProject.GetCompilationAsync();
             if (projCompilation is null) continue;
-            var projPath = roslynProject.FilePath ?? "";
-            var projRelativePath = Path.GetRelativePath(repoRootDir, projPath);
-            var projId = db.GetProjectIdByPath(projRelativePath);
-            if (projId is null) continue;
 
             var refExtractor = new ReferenceExtractor(projCompilation) { SymbolMap = symbolMap };
 
@@ -115,8 +165,8 @@ public sealed class IndexEngine
                 if (doc.SourceCodeKind != SourceCodeKind.Regular && doc.SourceCodeKind != SourceCodeKind.Script)
                     continue;
 
-                var fileRelPath = doc.FilePath is not null ? Path.GetRelativePath(repoRootDir, doc.FilePath) : doc.Name;
-                var fileId = db.GetFileIdByProjectAndPath(projId.Value, fileRelPath);
+                var fileRelPath = doc.FilePath is not null ? PathUtil.ToRepoRelative(_repoRoot, doc.FilePath) : PathUtil.Normalize(doc.Name);
+                var fileId = db.GetFileIdByProjectAndPath(projId, fileRelPath);
                 if (fileId is null) continue;
 
                 var (refs, edges) = refExtractor.Extract(doc, fileId.Value, includeReferences: true);
@@ -137,19 +187,20 @@ public sealed class IndexEngine
                 result.EdgesExtracted += edges.Count;
             }
         }
-
-        db.RebuildFtsIndex();
-        db.CommitTransaction();
-
-        UpdateCatalog(dbPath, solutionName, solutionRelPath, repoRootDir);
-
-        return result;
     }
 
-    private static void UpdateCatalog(string dbPath, string solutionName, string solutionRelPath, string repoRootDir)
+    private static void DeleteDatabaseFiles(string dbPath)
     {
-        var catalogDir = Path.GetDirectoryName(dbPath) ?? repoRootDir;
-        var catalogPath = Path.Combine(catalogDir, "catalog.db");
+        foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+    }
+
+    private static void UpdateCatalog(string dbPath, string solutionName, string solutionRelPath, string gitCommit, DateTime indexedAt)
+    {
+        var catalogPath = Path.Combine(Path.GetDirectoryName(dbPath)!, "catalog.db");
         using var catConn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={catalogPath};Pooling=False");
         catConn.Open();
         CatalogDatabase.EnsureSchema(catConn);
@@ -158,28 +209,34 @@ public sealed class IndexEngine
             SolutionName = solutionName,
             SolutionPath = solutionRelPath,
             DatabasePath = dbPath,
-            IndexedCommit = GetGitCommit(repoRootDir),
-            IndexedAt = DateTime.UtcNow.ToString("O"),
+            IndexedCommit = gitCommit,
+            IndexedAt = indexedAt.ToString("O"),
         });
     }
 
-    private static string GetGitCommit(string repoRoot)
+    /// <summary>The HEAD commit of the repository containing <paramref name="repoRoot"/>, or "unknown".</summary>
+    public static string GetGitCommit(string repoRoot)
     {
         try
         {
-            var gitDir = Path.Combine(repoRoot, ".git");
-            if (!Directory.Exists(gitDir)) return "unknown";
-            var headFile = Path.Combine(gitDir, "HEAD");
-            if (!File.Exists(headFile)) return "unknown";
-            var head = File.ReadAllText(headFile).Trim();
-            if (head.StartsWith("ref: "))
+            var psi = new ProcessStartInfo("git", "rev-parse HEAD")
             {
-                var refPath = Path.Combine(gitDir, head.Substring(5));
-                if (File.Exists(refPath)) return File.ReadAllText(refPath).Trim();
-            }
-            return head;
+                WorkingDirectory = repoRoot,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var process = Process.Start(psi);
+            if (process is null) return "unknown";
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            if (!process.WaitForExit(5000)) { process.Kill(); return "unknown"; }
+            return process.ExitCode == 0 && output.Length >= 7 ? output : "unknown";
         }
-        catch { return "unknown"; }
+        catch
+        {
+            return "unknown";
+        }
     }
 }
 

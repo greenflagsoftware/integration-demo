@@ -96,7 +96,7 @@ public class SolutionLoaderTests
     [Fact]
     public void ProjectFilter_IncludeOverridesDefaultExcludes()
     {
-        var filter = new ProjectFilter().Include("Tests");
+        var filter = new ProjectFilter().Include("*.Tests");
 
         Assert.True(filter.ShouldInclude("MyProject.Tests"));
     }
@@ -105,8 +105,8 @@ public class SolutionLoaderTests
     public void ProjectFilter_ExcludeAlwaysWins()
     {
         var filter = new ProjectFilter()
-            .Include("Lib")
-            .Exclude("Legacy");
+            .Include("MyLib.*")
+            .Exclude("*.Legacy");
 
         Assert.False(filter.ShouldInclude("MyLib.Legacy"));
         Assert.True(filter.ShouldInclude("MyLib.New"));

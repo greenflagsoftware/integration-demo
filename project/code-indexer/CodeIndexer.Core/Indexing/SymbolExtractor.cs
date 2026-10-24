@@ -46,6 +46,7 @@ public sealed class SymbolExtractor
 
         rows.Add(new SymbolRow
         {
+            Key = SymbolKey.For(symbol),
             Kind = kind,
             Name = symbol.Name,
             FullName = fullName,
@@ -63,6 +64,11 @@ public sealed class SymbolExtractor
             foreach (var member in namedType.GetMembers())
             {
                 if (member.IsImplicitlyDeclared || member is INamespaceSymbol) continue;
+                // Nested types are reached by the type walk; counting them here would emit them twice.
+                if (member is INamedTypeSymbol) continue;
+                // For a partial type, GetMembers() returns members of every part; keep only this part's.
+                var syn = member.DeclaringSyntaxReferences.FirstOrDefault(r => r.SyntaxTree == decl.SyntaxTree);
+                if (syn is null) continue;
                 var mkind = GetSymbolKind(member);
                 if (mkind == "namespace") continue;
                 // Skip property/event accessor methods.
@@ -70,15 +76,12 @@ public sealed class SymbolExtractor
                     continue;
                 var mg = isGenerated || HasGeneratedAttribute(member);
                 var memberFullName = GetFullName(member);
-                int sl = 0, el = 0;
-                var syn = member.DeclaringSyntaxReferences.FirstOrDefault();
-                if (syn is not null)
-                {
-                    sl = syn.GetSyntax().GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-                    el = syn.GetSyntax().GetLocation().GetLineSpan().EndLinePosition.Line + 1;
-                }
+                var span = syn.GetSyntax().GetLocation().GetLineSpan();
+                int sl = span.StartLinePosition.Line + 1;
+                int el = span.EndLinePosition.Line + 1;
                 rows.Add(new SymbolRow
                 {
+                    Key = SymbolKey.For(member),
                     Kind = mkind,
                     Name = member.Name,
                     FullName = memberFullName,
@@ -173,6 +176,7 @@ public sealed class SymbolRow
 {
     public long? Id { get; set; }
     public long? FileId { get; set; }
+    public required string Key { get; init; }
     public required string Kind { get; init; }
     public required string Name { get; init; }
     public required string FullName { get; init; }

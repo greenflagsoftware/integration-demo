@@ -34,7 +34,7 @@ public struct FileSymbolId(long fileId, long symbolId)
         private readonly Compilation _compilation;
 
         /// <summary>
-        /// Map from symbol full_name to its database row ID, populated by the caller.
+        /// Map from symbol key (see <see cref="SymbolKey"/>) to its database row ID, populated by the caller.
         /// </summary>
         public Dictionary<string, FileSymbolId> SymbolMap { get; set; } = new();
 
@@ -44,7 +44,7 @@ public struct FileSymbolId(long fileId, long symbolId)
         }
 
         /// <summary>
-        /// Build a fully qualified name consistent with SymbolExtractor.GetFullName.
+        /// Display name stored with a reference (not used for lookup).
         /// </summary>
         private static string GetFullName(ISymbol symbol)
         {
@@ -75,13 +75,13 @@ public struct FileSymbolId(long fileId, long symbolId)
         foreach (var typeDecl in typeDecls)
         {
             if (model.GetDeclaredSymbol(typeDecl) is not Microsoft.CodeAnalysis.INamedTypeSymbol typeSymbol) continue;
-            var typeFullName = GetFullName(typeSymbol);
+            var typeFullName = SymbolKey.For(typeSymbol);
             if (!SymbolMap.TryGetValue(typeFullName, out var fromIds)) continue;
 
             // Inheritance edges.
             if (typeSymbol.BaseType is not null)
             {
-                var baseFull = GetFullName(typeSymbol.BaseType);
+                var baseFull = SymbolKey.For(typeSymbol.BaseType);
                 if (SymbolMap.TryGetValue(baseFull, out var baseIds))
                     edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = baseIds.SymbolId, Kind = "inherits" });
             }
@@ -89,7 +89,7 @@ public struct FileSymbolId(long fileId, long symbolId)
             // Interface implementation edges.
             foreach (var iface in typeSymbol.Interfaces)
             {
-                var ifaceFull = GetFullName(iface);
+                var ifaceFull = SymbolKey.For(iface);
                 if (SymbolMap.TryGetValue(ifaceFull, out var ifaceIds))
                     edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = ifaceIds.SymbolId, Kind = "implements" });
             }
@@ -100,12 +100,12 @@ public struct FileSymbolId(long fileId, long symbolId)
         foreach (var methodDecl in methodDecls)
         {
             if (model.GetDeclaredSymbol(methodDecl) is not Microsoft.CodeAnalysis.IMethodSymbol methodSymbol) continue;
-            var methodFull = GetFullName(methodSymbol);
+            var methodFull = SymbolKey.For(methodSymbol);
             if (!SymbolMap.TryGetValue(methodFull, out var fromIds)) continue;
 
             if (methodSymbol.OverriddenMethod is not null)
             {
-                var overFull = GetFullName(methodSymbol.OverriddenMethod);
+                var overFull = SymbolKey.For(methodSymbol.OverriddenMethod);
                 if (SymbolMap.TryGetValue(overFull, out var overIds))
                     edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = overIds.SymbolId, Kind = "overrides" });
             }
@@ -116,7 +116,7 @@ public struct FileSymbolId(long fileId, long symbolId)
                 var ctorSymbol = model.GetSymbolInfo(creation).Symbol;
                 if (ctorSymbol?.ContainingType is not null)
                 {
-                    var ctorTypeFull = GetFullName(ctorSymbol.ContainingType);
+                    var ctorTypeFull = SymbolKey.For(ctorSymbol.ContainingType);
                     if (SymbolMap.TryGetValue(ctorTypeFull, out var ctorIds))
                         edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = ctorIds.SymbolId, Kind = "creates" });
                 }
@@ -129,7 +129,7 @@ public struct FileSymbolId(long fileId, long symbolId)
                 {
                     var invoked = model.GetSymbolInfo(invoke).Symbol;
                     if (invoked is null) continue;
-                    var invokedFull = GetFullName(invoked);
+                    var invokedFull = SymbolKey.For(invoked);
                     var lineSpan = invoke.GetLocation().GetLineSpan();
                     var line = lineSpan.StartLinePosition.Line + 1;
                     var col = lineSpan.StartLinePosition.Character + 1;
@@ -139,12 +139,12 @@ public struct FileSymbolId(long fileId, long symbolId)
                         // Edge for tracking call relationships.
                         edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = invokedIds.SymbolId, Kind = "calls" });
                         // Reference for per-file lookup.
-                        refs.Add(new ReferenceRow { SymbolId = invokedIds.SymbolId, FileId = fileId, Line = line, Column = col, Kind = "call", ReferenceName = invokedFull });
+                        refs.Add(new ReferenceRow { SymbolId = invokedIds.SymbolId, FileId = fileId, Line = line, Column = col, Kind = "call", ReferenceName = GetFullName(invoked) });
                     }
                     else
                     {
                         // Unresolved or external reference — still record it.
-                        refs.Add(new ReferenceRow { SymbolId = 0, FileId = fileId, Line = line, Column = col, Kind = "call", ReferenceName = invokedFull });
+                        refs.Add(new ReferenceRow { SymbolId = 0, FileId = fileId, Line = line, Column = col, Kind = "call", ReferenceName = GetFullName(invoked) });
                     }
                 }
 
@@ -153,14 +153,14 @@ public struct FileSymbolId(long fileId, long symbolId)
                 {
                     var member = model.GetSymbolInfo(access).Symbol;
                     if (member is null) continue;
-                    var memberFull = GetFullName(member);
+                    var memberFull = SymbolKey.For(member);
                     var lineSpan = access.GetLocation().GetLineSpan();
                     var line = lineSpan.StartLinePosition.Line + 1;
                     var col = lineSpan.StartLinePosition.Character + 1;
 
                     if (SymbolMap.TryGetValue(memberFull, out var memberIds))
                     {
-                        refs.Add(new ReferenceRow { SymbolId = memberIds.SymbolId, FileId = fileId, Line = line, Column = col, Kind = "access", ReferenceName = memberFull });
+                        refs.Add(new ReferenceRow { SymbolId = memberIds.SymbolId, FileId = fileId, Line = line, Column = col, Kind = "access", ReferenceName = GetFullName(member) });
                     }
                 }
             }
@@ -171,14 +171,14 @@ public struct FileSymbolId(long fileId, long symbolId)
         {
             var ctorSymbol = model.GetDeclaredSymbol(ctorDecl);
             if (ctorSymbol is null) continue;
-            var ctorFull = GetFullName(ctorSymbol);
+            var ctorFull = SymbolKey.For(ctorSymbol);
             if (!SymbolMap.TryGetValue(ctorFull, out var fromIds)) continue;
 
             foreach (var invoke in ctorDecl.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax>())
             {
                 var invoked = model.GetSymbolInfo(invoke).Symbol;
                 if (invoked is null) continue;
-                var invokedFull = GetFullName(invoked);
+                var invokedFull = SymbolKey.For(invoked);
                 if (SymbolMap.TryGetValue(invokedFull, out var invokedIds))
                     edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = invokedIds.SymbolId, Kind = "calls" });
             }
@@ -191,7 +191,7 @@ public struct FileSymbolId(long fileId, long symbolId)
     {
         var map = new Dictionary<string, FileSymbolId>();
         using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT id, full_name, file_id FROM symbols WHERE full_name IS NOT NULL";
+        cmd.CommandText = "SELECT id, key, file_id FROM symbols";
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {

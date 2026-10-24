@@ -67,6 +67,12 @@ infoCommand.SetHandler((string db, string solution) =>
     Console.WriteLine($"Indexed at: {infoDb.GetMeta("indexed_at")}");
     Console.WriteLine($"Repo root: {infoDb.GetMeta("repo_root")}");
     Console.WriteLine($"Git commit: {infoDb.GetMeta("git_commit")}");
+    var diagnostics = infoDb.GetDiagnostics();
+    Console.WriteLine($"Diagnostics: {diagnostics.Count(d => d.Severity == "Error")} errors, " +
+                      $"{diagnostics.Count(d => d.Severity == "Warning")} warnings, " +
+                      $"{diagnostics.Count(d => d.Severity == "Info")} info");
+    foreach (var (severity, message) in diagnostics)
+        Console.WriteLine($"  [{severity}] {message}");
 }, globalDbOption, globalSolutionOption);
 rootCommand.AddCommand(infoCommand);
 
@@ -362,7 +368,9 @@ static string FindRepoRoot(string solutionPath)
     var dir = Path.GetDirectoryName(Path.GetFullPath(solutionPath));
     while (dir is not null)
     {
-        if (Directory.Exists(Path.Combine(dir, ".git"))) return dir;
+        // ".git" is a directory in a normal clone and a file in a worktree or submodule.
+        var git = Path.Combine(dir, ".git");
+        if (Directory.Exists(git) || File.Exists(git)) return dir;
         dir = Path.GetDirectoryName(dir);
     }
     return Path.GetDirectoryName(Path.GetFullPath(solutionPath)) ?? ".";
