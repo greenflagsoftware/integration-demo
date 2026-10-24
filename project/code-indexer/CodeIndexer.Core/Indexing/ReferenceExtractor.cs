@@ -1,4 +1,6 @@
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace CodeIndexer.Core.Indexing;
 
@@ -9,6 +11,8 @@ public sealed class ReferenceRow
     public int Line { get; set; }
     public int Column { get; set; }
     public string Kind { get; set; } = "use";
+    /// <summary>The member (or type) whose body or declaration contains the reference, when it is an indexed symbol.</summary>
+    public long? EnclosingSymbolId { get; set; }
     public string? ReferenceName { get; set; }
 }
 
@@ -19,188 +23,269 @@ public sealed class EdgeRow
     public string Kind { get; set; } = "";
 }
 
-public struct FileSymbolId(long fileId, long symbolId)
-{
-    public long FileId = fileId;
-    public long SymbolId = symbolId;
-}
-
 /// <summary>
-    /// Walks each document's semantic model to extract resolved references
-    /// and typed relationship edges (inherits, implements, calls, overrides, creates).
-    /// </summary>
-    public sealed class ReferenceExtractor
+/// Resolves every name in a syntax tree to the symbol it denotes and records where it is used, how (call, read,
+/// write, type-use, ...), and by which member. Also derives the call and creation edges that follow from uses.
+/// </summary>
+public sealed class ReferenceExtractor
+{
+    /// <summary>Row id for a symbol, creating an external stub row when it is not indexed. Null when not representable.</summary>
+    public delegate long? Resolve(ISymbol symbol);
+
+    /// <summary>Row id of an indexed symbol, or null. Never creates rows.</summary>
+    public delegate long? Lookup(ISymbol symbol);
+
+    private readonly Compilation _compilation;
+    private readonly Resolve _resolve;
+    private readonly Lookup _lookup;
+
+    private SemanticModel _model = null!;
+    private long _fileId;
+    private List<ReferenceRow> _refs = null!;
+    private List<EdgeRow> _edges = null!;
+
+    public ReferenceExtractor(Compilation compilation, Resolve resolve, Lookup lookup)
     {
-        private readonly Compilation _compilation;
+        _compilation = compilation;
+        _resolve = resolve;
+        _lookup = lookup;
+    }
 
-        /// <summary>
-        /// Map from symbol key (see <see cref="SymbolKey"/>) to its database row ID, populated by the caller.
-        /// </summary>
-        public Dictionary<string, FileSymbolId> SymbolMap { get; set; } = new();
+    public (List<ReferenceRow> References, List<EdgeRow> Edges) Extract(SyntaxTree tree, long fileId)
+    {
+        _model = _compilation.GetSemanticModel(tree);
+        _fileId = fileId;
+        _refs = new List<ReferenceRow>();
+        _edges = new List<EdgeRow>();
 
-        public ReferenceExtractor(Compilation compilation)
+        foreach (var node in tree.GetRoot().DescendantNodes())
         {
-            _compilation = compilation;
-        }
-
-        /// <summary>
-        /// Display name stored with a reference (not used for lookup).
-        /// </summary>
-        private static string GetFullName(ISymbol symbol)
-        {
-            if (symbol.ContainingType is not null)
+            switch (node)
             {
-                var typeFull = symbol.ContainingType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                return typeFull + "." + symbol.Name;
+                case SimpleNameSyntax name:
+                    VisitName(name);
+                    break;
+                case ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax:
+                    VisitCreation((ExpressionSyntax)node);
+                    break;
+                case ConstructorInitializerSyntax initializer:
+                    VisitInitializer(initializer);
+                    break;
+                case ElementAccessExpressionSyntax elementAccess:
+                    VisitElementAccess(elementAccess);
+                    break;
             }
-            return symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
         }
+        return (_refs, _edges);
+    }
+
+    // ---- names ---------------------------------------------------------------------------------
+
+    private void VisitName(SimpleNameSyntax name)
+    {
+        if (name is IdentifierNameSyntax { IsVar: true }) return;
+
+        var info = _model.GetSymbolInfo(name);
+        var symbol = info.Symbol ?? (info.CandidateSymbols.Length == 1 ? info.CandidateSymbols[0] : null);
+        if (symbol is null) return;
+
+        symbol = Normalize(symbol, name);
+        if (symbol is null) return;
+
+        var id = _resolve(symbol);
+        if (id is null) return;
+
+        var enclosing = Enclosing(name);
+        foreach (var kind in Classify(name, symbol))
+        {
+            Add(name.GetLocation(), id.Value, kind, enclosing, symbol);
+            if (kind == "call" && symbol is IMethodSymbol && enclosing is not null)
+                _edges.Add(new EdgeRow { FromSymbolId = enclosing.Value, ToSymbolId = id.Value, Kind = "calls" });
+        }
+    }
 
     /// <summary>
-    /// Extract references and edges from a single document.
-    /// Returns (references, edges).
+    /// Maps what the semantic model returned to the declaration that is stored: the declared extension method for a
+    /// reduced call, the generic definition for a constructed one. Returns null for symbols that are not indexed
+    /// (locals, parameters, namespaces, type parameters, lambdas, ...).
     /// </summary>
-    public (List<ReferenceRow>, List<EdgeRow>) Extract(Document doc, long fileId, bool includeReferences)
+    private static ISymbol? Normalize(ISymbol symbol, SimpleNameSyntax name)
     {
-        var refs = new List<ReferenceRow>();
-        var edges = new List<EdgeRow>();
-        var tree = doc.GetSyntaxTreeAsync().Result;
-        if (tree is null) return (refs, edges);
-
-        var model = _compilation.GetSemanticModel(tree);
-        var root = tree.GetRoot();
-
-        // Extract type hierarchy edges.
-        var typeDecls = root.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.BaseTypeDeclarationSyntax>();
-        foreach (var typeDecl in typeDecls)
+        switch (symbol)
         {
-            if (model.GetDeclaredSymbol(typeDecl) is not Microsoft.CodeAnalysis.INamedTypeSymbol typeSymbol) continue;
-            var typeFullName = SymbolKey.For(typeSymbol);
-            if (!SymbolMap.TryGetValue(typeFullName, out var fromIds)) continue;
-
-            // Inheritance edges.
-            if (typeSymbol.BaseType is not null)
-            {
-                var baseFull = SymbolKey.For(typeSymbol.BaseType);
-                if (SymbolMap.TryGetValue(baseFull, out var baseIds))
-                    edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = baseIds.SymbolId, Kind = "inherits" });
-            }
-
-            // Interface implementation edges.
-            foreach (var iface in typeSymbol.Interfaces)
-            {
-                var ifaceFull = SymbolKey.For(iface);
-                if (SymbolMap.TryGetValue(ifaceFull, out var ifaceIds))
-                    edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = ifaceIds.SymbolId, Kind = "implements" });
-            }
+            case IMethodSymbol method:
+                if (method.MethodKind is MethodKind.LocalFunction or MethodKind.AnonymousFunction
+                    or MethodKind.BuiltinOperator or MethodKind.DelegateInvoke or MethodKind.FunctionPointerSignature)
+                    return null;
+                if (method.ReducedFrom is not null) method = method.ReducedFrom;
+                // `[Foo]` binds to the attribute's constructor; the use that matters is the attribute type.
+                if (method.MethodKind == MethodKind.Constructor && name.Ancestors().OfType<AttributeSyntax>().Any())
+                    return method.ContainingType.OriginalDefinition;
+                return method.OriginalDefinition;
+            case IPropertySymbol or IFieldSymbol or IEventSymbol:
+                return symbol.OriginalDefinition;
+            case INamedTypeSymbol type:
+                if (type.TypeKind == TypeKind.Error || type.IsAnonymousType) return null;
+                return type.OriginalDefinition;
+            default:
+                return null;
         }
-
-        // Extract method override edges.
-        var methodDecls = root.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax>();
-        foreach (var methodDecl in methodDecls)
-        {
-            if (model.GetDeclaredSymbol(methodDecl) is not Microsoft.CodeAnalysis.IMethodSymbol methodSymbol) continue;
-            var methodFull = SymbolKey.For(methodSymbol);
-            if (!SymbolMap.TryGetValue(methodFull, out var fromIds)) continue;
-
-            if (methodSymbol.OverriddenMethod is not null)
-            {
-                var overFull = SymbolKey.For(methodSymbol.OverriddenMethod);
-                if (SymbolMap.TryGetValue(overFull, out var overIds))
-                    edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = overIds.SymbolId, Kind = "overrides" });
-            }
-
-            // Object creation edges.
-            foreach (var creation in methodDecl.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax>())
-            {
-                var ctorSymbol = model.GetSymbolInfo(creation).Symbol;
-                if (ctorSymbol?.ContainingType is not null)
-                {
-                    var ctorTypeFull = SymbolKey.For(ctorSymbol.ContainingType);
-                    if (SymbolMap.TryGetValue(ctorTypeFull, out var ctorIds))
-                        edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = ctorIds.SymbolId, Kind = "creates" });
-                }
-            }
-
-            // Call edges and references.
-            if (includeReferences)
-            {
-                foreach (var invoke in methodDecl.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax>())
-                {
-                    var invoked = model.GetSymbolInfo(invoke).Symbol;
-                    if (invoked is null) continue;
-                    var invokedFull = SymbolKey.For(invoked);
-                    var lineSpan = invoke.GetLocation().GetLineSpan();
-                    var line = lineSpan.StartLinePosition.Line + 1;
-                    var col = lineSpan.StartLinePosition.Character + 1;
-
-                    if (SymbolMap.TryGetValue(invokedFull, out var invokedIds))
-                    {
-                        // Edge for tracking call relationships.
-                        edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = invokedIds.SymbolId, Kind = "calls" });
-                        // Reference for per-file lookup.
-                        refs.Add(new ReferenceRow { SymbolId = invokedIds.SymbolId, FileId = fileId, Line = line, Column = col, Kind = "call", ReferenceName = GetFullName(invoked) });
-                    }
-                    else
-                    {
-                        // Unresolved or external reference — still record it.
-                        refs.Add(new ReferenceRow { SymbolId = 0, FileId = fileId, Line = line, Column = col, Kind = "call", ReferenceName = GetFullName(invoked) });
-                    }
-                }
-
-                // Field/property access references.
-                foreach (var access in methodDecl.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax>())
-                {
-                    var member = model.GetSymbolInfo(access).Symbol;
-                    if (member is null) continue;
-                    var memberFull = SymbolKey.For(member);
-                    var lineSpan = access.GetLocation().GetLineSpan();
-                    var line = lineSpan.StartLinePosition.Line + 1;
-                    var col = lineSpan.StartLinePosition.Character + 1;
-
-                    if (SymbolMap.TryGetValue(memberFull, out var memberIds))
-                    {
-                        refs.Add(new ReferenceRow { SymbolId = memberIds.SymbolId, FileId = fileId, Line = line, Column = col, Kind = "access", ReferenceName = GetFullName(member) });
-                    }
-                }
-            }
-        }
-
-        // Constructor call edges and references.
-        foreach (var ctorDecl in root.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax>())
-        {
-            var ctorSymbol = model.GetDeclaredSymbol(ctorDecl);
-            if (ctorSymbol is null) continue;
-            var ctorFull = SymbolKey.For(ctorSymbol);
-            if (!SymbolMap.TryGetValue(ctorFull, out var fromIds)) continue;
-
-            foreach (var invoke in ctorDecl.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax>())
-            {
-                var invoked = model.GetSymbolInfo(invoke).Symbol;
-                if (invoked is null) continue;
-                var invokedFull = SymbolKey.For(invoked);
-                if (SymbolMap.TryGetValue(invokedFull, out var invokedIds))
-                    edges.Add(new EdgeRow { FromSymbolId = fromIds.SymbolId, ToSymbolId = invokedIds.SymbolId, Kind = "calls" });
-            }
-        }
-
-        return (refs, edges);
     }
 
-    public static Dictionary<string, FileSymbolId> LoadSymbolMap(Microsoft.Data.Sqlite.SqliteConnection connection)
+    // ---- reference kinds -----------------------------------------------------------------------
+
+    private IReadOnlyList<string> Classify(SimpleNameSyntax name, ISymbol target)
     {
-        var map = new Dictionary<string, FileSymbolId>();
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT id, key, file_id FROM symbols";
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
+        // Climb to the whole expression the name is the last part of (A.B.C, a?.B, global::A).
+        ExpressionSyntax top = name;
+        while (true)
         {
-            var id = reader.GetInt64(0);
-            var name = reader.GetString(1);
-            var fid = reader.GetInt64(2);
-            map[name] = new FileSymbolId(fid, id);
+            if (top.Parent is QualifiedNameSyntax q && q.Right == top) top = q;
+            else if (top.Parent is AliasQualifiedNameSyntax aq && aq.Name == top) top = aq;
+            else if (top.Parent is MemberAccessExpressionSyntax m && m.Name == top) top = m;
+            else if (top.Parent is MemberBindingExpressionSyntax mb && mb.Name == top) top = mb;
+            else break;
         }
-        return map;
+
+        if (IsNameofArgument(top)) return new[] { "nameof" };
+
+        if (target is INamedTypeSymbol)
+        {
+            return top.Parent switch
+            {
+                TypeOfExpressionSyntax => new[] { "typeof" },
+                AttributeSyntax attribute when attribute.Name == top => new[] { "attribute" },
+                BaseTypeSyntax => new[] { target.TypeKindIsInterface() ? "implement" : "inherit" },
+                _ => new[] { "type-use" },
+            };
+        }
+
+        if (target is IMethodSymbol)
+            return top.Parent is InvocationExpressionSyntax invocation && invocation.Expression == top
+                ? new[] { "call" }
+                : new[] { "use" };
+
+        return AccessKinds(top, target);
+    }
+
+    private static IReadOnlyList<string> AccessKinds(ExpressionSyntax top, ISymbol target)
+    {
+        switch (top.Parent)
+        {
+            case AssignmentExpressionSyntax assignment when assignment.Left == top:
+                if (target is IEventSymbol || assignment.IsKind(SyntaxKind.SimpleAssignmentExpression))
+                    return new[] { "write" };
+                return new[] { "write", "read" };
+            case PrefixUnaryExpressionSyntax prefix when prefix.Operand == top
+                                                         && (prefix.IsKind(SyntaxKind.PreIncrementExpression) || prefix.IsKind(SyntaxKind.PreDecrementExpression)):
+                return new[] { "write", "read" };
+            case PostfixUnaryExpressionSyntax postfix when postfix.Operand == top
+                                                           && (postfix.IsKind(SyntaxKind.PostIncrementExpression) || postfix.IsKind(SyntaxKind.PostDecrementExpression)):
+                return new[] { "write", "read" };
+            case ArgumentSyntax argument when argument.Expression == top:
+                if (argument.RefKindKeyword.IsKind(SyntaxKind.OutKeyword)) return new[] { "write" };
+                if (argument.RefKindKeyword.IsKind(SyntaxKind.RefKeyword)) return new[] { "write", "read" };
+                break;
+        }
+        return new[] { "read" };
+    }
+
+    private bool IsNameofArgument(ExpressionSyntax top) =>
+        top.Parent is ArgumentSyntax { Parent: ArgumentListSyntax { Parent: InvocationExpressionSyntax invocation } }
+        && invocation.Expression is IdentifierNameSyntax { Identifier.ValueText: "nameof" }
+        && _model.GetSymbolInfo(invocation).Symbol is null;
+
+    // ---- creation, constructor initializers, indexers ------------------------------------------
+
+    private void VisitCreation(ExpressionSyntax creation)
+    {
+        var constructor = _model.GetSymbolInfo(creation).Symbol as IMethodSymbol;
+        var createdType = (constructor?.ContainingType ?? _model.GetTypeInfo(creation).Type as INamedTypeSymbol)?.OriginalDefinition;
+        if (createdType is null || createdType.TypeKind == TypeKind.Error) return;
+
+        // A type with no declared constructor has an implicit one that is not stored; link to the type instead.
+        bool explicitConstructor = constructor is not null && !constructor.IsImplicitlyDeclared;
+        ISymbol target = explicitConstructor ? constructor!.OriginalDefinition : createdType;
+        var id = _resolve(target);
+        if (id is null) return;
+
+        var enclosing = Enclosing(creation);
+        // `new Foo()` already records the type name as a use; only add a row where no type name exists.
+        if (explicitConstructor || creation is ImplicitObjectCreationExpressionSyntax)
+            Add(creation.GetLocation(), id.Value, "create", enclosing, target);
+        if (enclosing is not null)
+            _edges.Add(new EdgeRow { FromSymbolId = enclosing.Value, ToSymbolId = id.Value, Kind = "creates" });
+    }
+
+    private void VisitInitializer(ConstructorInitializerSyntax initializer)
+    {
+        if (_model.GetSymbolInfo(initializer).Symbol is not IMethodSymbol constructor || constructor.IsImplicitlyDeclared)
+            return;
+        var id = _resolve(constructor.OriginalDefinition);
+        if (id is null) return;
+
+        var enclosing = Enclosing(initializer);
+        Add(initializer.ThisOrBaseKeyword.GetLocation(), id.Value, "call", enclosing, constructor.OriginalDefinition);
+        if (enclosing is not null)
+            _edges.Add(new EdgeRow { FromSymbolId = enclosing.Value, ToSymbolId = id.Value, Kind = "calls" });
+    }
+
+    private void VisitElementAccess(ElementAccessExpressionSyntax access)
+    {
+        if (_model.GetSymbolInfo(access).Symbol is not IPropertySymbol indexer) return;
+        var id = _resolve(indexer.OriginalDefinition);
+        if (id is null) return;
+
+        var enclosing = Enclosing(access);
+        foreach (var kind in AccessKinds(access, indexer))
+            Add(access.ArgumentList.OpenBracketToken.GetLocation(), id.Value, kind, enclosing, indexer.OriginalDefinition);
+    }
+
+    // ---- the enclosing member ------------------------------------------------------------------
+
+    /// <summary>
+    /// The nearest enclosing declaration that is an indexed symbol: a method, constructor, property (its accessors
+    /// and initializer included), event, field, or, failing those, the type that contains the node.
+    /// Lambdas and local functions belong to the member that contains them.
+    /// </summary>
+    private long? Enclosing(SyntaxNode node)
+    {
+        for (var n = node.Parent; n is not null; n = n.Parent)
+        {
+            ISymbol? declared = n switch
+            {
+                MethodDeclarationSyntax or ConstructorDeclarationSyntax or DestructorDeclarationSyntax
+                    or OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax
+                    or PropertyDeclarationSyntax or IndexerDeclarationSyntax or EventDeclarationSyntax
+                    or EnumMemberDeclarationSyntax or BaseTypeDeclarationSyntax or DelegateDeclarationSyntax
+                    => _model.GetDeclaredSymbol(n),
+                VariableDeclaratorSyntax { Parent.Parent: FieldDeclarationSyntax or EventFieldDeclarationSyntax }
+                    => _model.GetDeclaredSymbol(n),
+                _ => null,
+            };
+            if (declared is not null)
+                return _lookup(declared.OriginalDefinition);
+        }
+        return null;
+    }
+
+    private void Add(Location location, long symbolId, string kind, long? enclosing, ISymbol target)
+    {
+        var start = location.GetLineSpan().StartLinePosition;
+        _refs.Add(new ReferenceRow
+        {
+            SymbolId = symbolId,
+            FileId = _fileId,
+            Line = start.Line + 1,
+            Column = start.Character + 1,
+            Kind = kind,
+            EnclosingSymbolId = enclosing,
+            ReferenceName = SymbolFacts.FullName(target),
+        });
     }
 }
-           
+
+internal static class SymbolExtensions
+{
+    public static bool TypeKindIsInterface(this ISymbol symbol) => symbol is INamedTypeSymbol { TypeKind: TypeKind.Interface };
+}

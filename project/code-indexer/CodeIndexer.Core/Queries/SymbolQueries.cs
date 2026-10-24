@@ -354,7 +354,7 @@ public sealed class SymbolQueries : IDisposable
         using var cmd = _connection.CreateCommand();
 
         // Resolve symbol_id by name or full_name
-        cmd.CommandText = "SELECT id, name, full_name FROM symbols WHERE name = @q OR full_name = @q LIMIT 1";
+        cmd.CommandText = "SELECT id, name, full_name FROM symbols WHERE (name = @q OR full_name = @q) AND is_external = 0 AND kind <> 'namespace' LIMIT 1";
         cmd.Parameters.AddWithValue("@q", symbolName);
         long symId = 0;
         string symName = "", symFull = "";
@@ -545,7 +545,7 @@ public sealed class SymbolQueries : IDisposable
         var results = new List<CallerCalleeResult>();
         using var cmd = _connection.CreateCommand();
 
-        cmd.CommandText = "SELECT id FROM symbols WHERE name = @q OR full_name = @q LIMIT 1";
+        cmd.CommandText = "SELECT id FROM symbols WHERE (name = @q OR full_name = @q) AND is_external = 0 AND kind <> 'namespace' LIMIT 1";
         cmd.Parameters.AddWithValue("@q", interfaceName);
         var ifaceId = cmd.ExecuteScalar() as long?;
 
@@ -595,7 +595,7 @@ public sealed class SymbolQueries : IDisposable
     {
         var (solName, solPath, solIndexed, solCommit) = GetSolutionContext();
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT id, name, full_name, kind, accessibility FROM symbols WHERE name = @q OR full_name = @q ORDER BY kind LIMIT 1";
+        cmd.CommandText = "SELECT id, name, full_name, kind, accessibility FROM symbols WHERE (name = @q OR full_name = @q) AND is_external = 0 AND kind <> 'namespace' ORDER BY kind LIMIT 1";
         cmd.Parameters.AddWithValue("@q", typeName);
 
         long rootId;
@@ -634,7 +634,7 @@ public sealed class SymbolQueries : IDisposable
     private long? ResolveSymbolId(string name)
     {
         using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT id FROM symbols WHERE name = @q OR full_name = @q LIMIT 1";
+        cmd.CommandText = "SELECT id FROM symbols WHERE (name = @q OR full_name = @q) AND is_external = 0 AND kind <> 'namespace' LIMIT 1";
         cmd.Parameters.AddWithValue("@q", name);
         return cmd.ExecuteScalar() as long?;
     }

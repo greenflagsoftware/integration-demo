@@ -58,6 +58,14 @@ public sealed class IndexEngine
         return result;
     }
 
+    private sealed class ProjectWork
+    {
+        public required IndexedProject Project { get; init; }
+        public required Compilation? Compilation { get; init; }
+        public required List<(SyntaxTree Tree, long FileId)> Trees { get; init; }
+        public List<SymbolEdge> Edges { get; set; } = new();
+    }
+
     private async Task WriteIndexAsync(
         IndexDatabase db, SolutionLoadResult loadResult, string solutionName, string solutionRelPath,
         DateTime indexedAt, IndexResult result)
@@ -69,17 +77,69 @@ public sealed class IndexEngine
         foreach (var d in loadResult.Diagnostics)
             db.InsertDiagnostic(d, null, null);
 
-        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
-        var projectIds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-        var indexed = new List<(IndexedProject Project, long ProjectId)>();
+        // Symbol identity: every row is reachable by its key, whichever project or syntax node it came from.
+        var keyToId = new Dictionary<string, long>(StringComparer.Ordinal);
+        var keyCache = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
 
-        // Pass 1: projects, files, symbols.
+        string KeyOf(ISymbol symbol)
+        {
+            var definition = symbol.OriginalDefinition;
+            if (!keyCache.TryGetValue(definition, out var key))
+                keyCache[definition] = key = SymbolKey.For(definition);
+            return key;
+        }
+
+        long? Lookup(ISymbol symbol) => keyToId.TryGetValue(KeyOf(symbol), out var id) ? id : null;
+
+        // Symbols that are used but not declared in an indexed project (framework, NuGet, excluded projects)
+        // get a stub row so calls to them can be queried.
+        long? ResolveOrAdd(ISymbol symbol)
+        {
+            symbol = symbol.OriginalDefinition;
+            if (Lookup(symbol) is { } existing) return existing;
+            if (!CanStub(symbol)) return null;
+
+            long? containerId = symbol.ContainingType is { } containingType ? ResolveOrAdd(containingType) : null;
+            var id = db.InsertSymbol(null, KeyOf(symbol), SymbolFacts.Kind(symbol), symbol.Name, SymbolFacts.FullName(symbol),
+                containerId, SymbolFacts.Signature(symbol), SymbolFacts.Accessibility(symbol), null, null, null,
+                isGenerated: false, isExternal: true, assembly: symbol.ContainingAssembly?.Name);
+            keyToId[KeyOf(symbol)] = id;
+            result.ExternalSymbolsIndexed++;
+            return id;
+        }
+
+        void WriteSymbol(SymbolRow row)
+        {
+            if (keyToId.TryGetValue(row.Key, out var existingId))
+            {
+                // Declared again (a namespace shared by projects): only the extra locations are new.
+                foreach (var loc in row.Locations)
+                    db.InsertLocation(existingId, loc.FileId, loc.StartLine, loc.StartColumn, loc.EndLine, loc.EndColumn, false);
+                return;
+            }
+
+            long? containerId = row.ContainerKey is not null && keyToId.TryGetValue(row.ContainerKey, out var cid) ? cid : null;
+            var primary = row.Primary;
+            bool isNamespace = row.Kind == "namespace";
+            var id = db.InsertSymbol(isNamespace ? null : primary.FileId, row.Key, row.Kind, row.Name, row.FullName, containerId,
+                row.Signature, row.Accessibility, isNamespace ? null : primary.StartLine, isNamespace ? null : primary.EndLine,
+                row.DocSummary, row.IsGenerated);
+            keyToId[row.Key] = id;
+            foreach (var loc in row.Locations)
+                db.InsertLocation(id, loc.FileId, loc.StartLine, loc.StartColumn, loc.EndLine, loc.EndColumn, loc.IsPrimary);
+            if (!isNamespace) result.SymbolsIndexed++;
+        }
+
+        var work = new List<ProjectWork>();
+        var projectPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Pass 1: projects, files, declared symbols.
         foreach (var project in loadResult.IndexableProjects)
         {
             var roslynProject = project.RoslynProject!;
             var projectPath = roslynProject.FilePath ?? "";
             var projectRelativePath = PathUtil.ToRepoRelative(_repoRoot, projectPath);
-            if (projectIds.ContainsKey(projectRelativePath))
+            if (!projectPaths.Add(projectRelativePath))
                 continue;
 
             bool isExternal = !string.IsNullOrEmpty(projectPath) && !PathUtil.IsUnderDirectory(projectPath, solutionDir);
@@ -88,9 +148,6 @@ public sealed class IndexEngine
                 project.Name, projectRelativePath,
                 string.Join(";", project.AllTargetFrameworks),
                 project.TargetFramework, project.Language, isExternal);
-            projectIds[projectRelativePath] = projectId;
-            indexed.Add((project, projectId));
-
             db.LinkSolutionProject(solutionId, projectId);
             result.ProjectsIndexed++;
 
@@ -111,8 +168,22 @@ public sealed class IndexEngine
                 db.InsertDiagnostic(restore, projectId, null);
             }
 
+            if (roslynProject.Language != LanguageNames.CSharp)
+            {
+                var unsupported = new DiagnosticEntry
+                {
+                    Severity = Models.DiagnosticSeverity.Warning,
+                    Message = $"Project '{project.Name}' is {roslynProject.Language}; only C# projects are indexed.",
+                    ProjectPath = projectPath,
+                };
+                result.Diagnostics.Add(unsupported);
+                db.InsertDiagnostic(unsupported, projectId, null);
+                continue;
+            }
+
             var compilation = await roslynProject.GetCompilationAsync();
-            var extractor = compilation is null ? null : new SymbolExtractor(compilation);
+            var files = new Dictionary<SyntaxTree, FileRef>();
+            var projectWork = new ProjectWork { Project = project, Compilation = compilation, Trees = new() };
 
             foreach (var doc in roslynProject.Documents)
             {
@@ -133,61 +204,60 @@ public sealed class IndexEngine
                 var fileId = db.InsertFile(projectId, fileRelPath, contentHash, text.Lines.Count, isGenerated);
                 result.FilesIndexed++;
 
-                if (extractor is null) continue;
-
-                foreach (var sym in extractor.Extract(new[] { doc }))
-                {
-                    // A partial type is declared in several documents; the first declaration owns the row.
-                    if (!seenKeys.Add(sym.Key)) continue;
-
-                    sym.FileId = fileId;
-                    sym.Id = db.InsertSymbol(fileId, sym.Key, sym.Kind, sym.Name, sym.FullName, sym.ContainerId,
-                        sym.Signature, sym.Accessibility, sym.StartLine, sym.EndLine,
-                        sym.DocSummary, sym.IsGenerated);
-                    result.SymbolsIndexed++;
-                }
+                if (syntaxTree is null) continue;
+                files[syntaxTree] = new FileRef(fileId, isGenerated);
+                projectWork.Trees.Add((syntaxTree, fileId));
             }
+
+            work.Add(projectWork);
+            if (compilation is null) continue;
+
+            var extraction = new SymbolExtractor(compilation).Extract(files);
+            foreach (var row in extraction.Symbols)
+                WriteSymbol(row);
+            projectWork.Edges = extraction.Edges;
         }
 
-        // Pass 2: references and edges, once every symbol has an id.
-        var symbolMap = ReferenceExtractor.LoadSymbolMap(db.Connection);
-
-        foreach (var (project, projId) in indexed)
+        // Pass 2: relationships and references, once every declared symbol has an id.
+        foreach (var item in work)
         {
-            var roslynProject = project.RoslynProject!;
-            var projCompilation = await roslynProject.GetCompilationAsync();
-            if (projCompilation is null) continue;
+            if (item.Compilation is null) continue;
 
-            var refExtractor = new ReferenceExtractor(projCompilation) { SymbolMap = symbolMap };
-
-            foreach (var doc in roslynProject.Documents)
+            foreach (var edge in item.Edges)
             {
-                if (doc.SourceCodeKind != SourceCodeKind.Regular && doc.SourceCodeKind != SourceCodeKind.Script)
-                    continue;
+                var from = ResolveOrAdd(edge.From);
+                var to = ResolveOrAdd(edge.To);
+                if (from is null || to is null) continue;
+                db.InsertEdge(from.Value, to.Value, edge.Kind);
+                result.EdgesExtracted++;
+            }
 
-                var fileRelPath = doc.FilePath is not null ? PathUtil.ToRepoRelative(_repoRoot, doc.FilePath) : PathUtil.Normalize(doc.Name);
-                var fileId = db.GetFileIdByProjectAndPath(projId, fileRelPath);
-                if (fileId is null) continue;
-
-                var (refs, edges) = refExtractor.Extract(doc, fileId.Value, includeReferences: true);
+            var extractor = new ReferenceExtractor(item.Compilation, ResolveOrAdd, Lookup);
+            foreach (var (tree, fileId) in item.Trees)
+            {
+                var (refs, edges) = extractor.Extract(tree, fileId);
 
                 foreach (var r in refs)
-                {
-                    if (r.SymbolId > 0)
-                        db.InsertReference(r.SymbolId, r.FileId, r.Line, r.Column, r.Kind, r.ReferenceName);
-                }
-
+                    db.InsertReference(r.SymbolId, r.FileId, r.Line, r.Column, r.Kind, r.EnclosingSymbolId, r.ReferenceName);
                 foreach (var e in edges)
-                {
-                    if (e.FromSymbolId > 0 && e.ToSymbolId > 0)
-                        db.InsertEdge(e.FromSymbolId, e.ToSymbolId, e.Kind);
-                }
+                    db.InsertEdge(e.FromSymbolId, e.ToSymbolId, e.Kind);
 
                 result.ReferencesExtracted += refs.Count;
                 result.EdgesExtracted += edges.Count;
             }
         }
     }
+
+    /// <summary>Whether a used-but-not-indexed symbol is worth a stub row.</summary>
+    private static bool CanStub(ISymbol symbol) => symbol switch
+    {
+        INamedTypeSymbol type => type.TypeKind != TypeKind.Error && !type.IsAnonymousType,
+        IMethodSymbol method => !SymbolFacts.IsAccessor(method) && method.MethodKind is not
+            (MethodKind.LocalFunction or MethodKind.AnonymousFunction or MethodKind.BuiltinOperator
+            or MethodKind.FunctionPointerSignature or MethodKind.DelegateInvoke),
+        IPropertySymbol or IFieldSymbol or IEventSymbol => true,
+        _ => false,
+    };
 
     private static void DeleteDatabaseFiles(string dbPath)
     {
@@ -247,5 +317,6 @@ public sealed class IndexResult
     public int SymbolsIndexed { get; set; }
     public int ReferencesExtracted { get; set; }
     public int EdgesExtracted { get; set; }
+    public int ExternalSymbolsIndexed { get; set; }
     public List<DiagnosticEntry> Diagnostics { get; init; } = new();
 }

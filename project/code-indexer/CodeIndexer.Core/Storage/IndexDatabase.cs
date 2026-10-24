@@ -114,12 +114,12 @@ public sealed class IndexDatabase : IDisposable
         return (long)cmd.ExecuteScalar()!;
     }
 
-    public long InsertSymbol(long fileId, string key, string kind, string name, string fullName, long? containerId, string? signature, string? accessibility, int? startLine, int? endLine, string? docSummary, bool isGenerated)
+    public long InsertSymbol(long? fileId, string key, string kind, string name, string fullName, long? containerId, string? signature, string? accessibility, int? startLine, int? endLine, string? docSummary, bool isGenerated, bool isExternal = false, string? assembly = null)
     {
         var cmd = Prepared(
-            "INSERT INTO symbols (file_id, key, kind, name, full_name, container_id, signature, accessibility, start_line, end_line, doc_summary, is_generated) VALUES (@fid, @key, @kind, @name, @full, @cid, @sig, @acc, @start, @end, @doc, @gen) RETURNING id",
-            "@fid", "@key", "@kind", "@name", "@full", "@cid", "@sig", "@acc", "@start", "@end", "@doc", "@gen");
-        cmd.Parameters["@fid"].Value = fileId;
+            "INSERT INTO symbols (file_id, key, kind, name, full_name, container_id, signature, accessibility, start_line, end_line, doc_summary, is_generated, is_external, assembly) VALUES (@fid, @key, @kind, @name, @full, @cid, @sig, @acc, @start, @end, @doc, @gen, @ext, @asm) RETURNING id",
+            "@fid", "@key", "@kind", "@name", "@full", "@cid", "@sig", "@acc", "@start", "@end", "@doc", "@gen", "@ext", "@asm");
+        cmd.Parameters["@fid"].Value = Db(fileId);
         cmd.Parameters["@key"].Value = key;
         cmd.Parameters["@kind"].Value = kind;
         cmd.Parameters["@name"].Value = name;
@@ -131,7 +131,24 @@ public sealed class IndexDatabase : IDisposable
         cmd.Parameters["@end"].Value = Db(endLine);
         cmd.Parameters["@doc"].Value = Db(docSummary);
         cmd.Parameters["@gen"].Value = isGenerated ? 1 : 0;
+        cmd.Parameters["@ext"].Value = isExternal ? 1 : 0;
+        cmd.Parameters["@asm"].Value = Db(assembly);
         return (long)cmd.ExecuteScalar()!;
+    }
+
+    public void InsertLocation(long symbolId, long fileId, int startLine, int startCol, int endLine, int endCol, bool isPrimary)
+    {
+        var cmd = Prepared(
+            "INSERT INTO symbol_locations (symbol_id, file_id, start_line, start_col, end_line, end_col, is_primary) VALUES (@sid, @fid, @sl, @sc, @el, @ec, @p)",
+            "@sid", "@fid", "@sl", "@sc", "@el", "@ec", "@p");
+        cmd.Parameters["@sid"].Value = symbolId;
+        cmd.Parameters["@fid"].Value = fileId;
+        cmd.Parameters["@sl"].Value = startLine;
+        cmd.Parameters["@sc"].Value = startCol;
+        cmd.Parameters["@el"].Value = endLine;
+        cmd.Parameters["@ec"].Value = endCol;
+        cmd.Parameters["@p"].Value = isPrimary ? 1 : 0;
+        cmd.ExecuteNonQuery();
     }
 
     public void InsertDiagnostic(DiagnosticEntry diagnostic, long? projectId, long? fileId)
@@ -154,16 +171,17 @@ public sealed class IndexDatabase : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    public void InsertReference(long symbolId, long fileId, int line, int column, string kind, string? referenceName)
+    public void InsertReference(long symbolId, long fileId, int line, int column, string kind, long? enclosingSymbolId, string? referenceName)
     {
         var cmd = Prepared(
-            "INSERT INTO symbol_references (symbol_id, file_id, line, column, kind, reference_name) VALUES (@sid, @fid, @line, @col, @kind, @rname)",
-            "@sid", "@fid", "@line", "@col", "@kind", "@rname");
+            "INSERT INTO symbol_references (symbol_id, file_id, line, column, kind, enclosing_symbol_id, reference_name) VALUES (@sid, @fid, @line, @col, @kind, @enc, @rname)",
+            "@sid", "@fid", "@line", "@col", "@kind", "@enc", "@rname");
         cmd.Parameters["@sid"].Value = symbolId;
         cmd.Parameters["@fid"].Value = fileId;
         cmd.Parameters["@line"].Value = line;
         cmd.Parameters["@col"].Value = column;
         cmd.Parameters["@kind"].Value = kind;
+        cmd.Parameters["@enc"].Value = Db(enclosingSymbolId);
         cmd.Parameters["@rname"].Value = Db(referenceName);
         cmd.ExecuteNonQuery();
     }

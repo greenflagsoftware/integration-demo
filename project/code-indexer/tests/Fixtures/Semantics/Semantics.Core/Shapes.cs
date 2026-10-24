@@ -14,7 +14,7 @@ public abstract class ShapeBase : IShape
     public string Describe() => $"{Name}: {Area()}"; // @describe
 }
 
-public class Circle : ShapeBase
+public class Circle : ShapeBase // @circle-class
 {
     public double Radius { get; init; } // @circle-radius
     public override double Area() => Math.PI * Radius * Radius; // @circle-area
@@ -27,7 +27,7 @@ public class Square : ShapeBase
     public override double Area() => Side * Side; // @square-area
 }
 
-public class Triangle : IShape
+public class Triangle : IShape // @triangle-class
 {
     double IShape.Area() => 0.5; // @triangle-area
     public string Name => "triangle"; // @triangle-name

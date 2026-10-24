@@ -1,145 +1,232 @@
-using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace CodeIndexer.Core.Indexing;
 
+/// <summary>A source file known to the database, as seen by the extractor.</summary>
+public sealed record FileRef(long FileId, bool IsGenerated);
+
+public sealed class SymbolLocation
+{
+    public required long FileId { get; init; }
+    public required int StartLine { get; init; }
+    public required int StartColumn { get; init; }
+    public required int EndLine { get; init; }
+    public required int EndColumn { get; init; }
+    public bool IsPrimary { get; set; }
+}
+
+public sealed class SymbolRow
+{
+    public required string Key { get; init; }
+    public required string Kind { get; init; }
+    public required string Name { get; init; }
+    public required string FullName { get; init; }
+    /// <summary>Key of the containing namespace or type; always emitted before this row.</summary>
+    public string? ContainerKey { get; init; }
+    public string? Signature { get; init; }
+    public string? Accessibility { get; init; }
+    public string? DocSummary { get; init; }
+    public bool IsGenerated { get; init; }
+    public required List<SymbolLocation> Locations { get; init; }
+
+    public SymbolLocation Primary => Locations.First(l => l.IsPrimary);
+}
+
+/// <summary>A relationship between two symbols that follows from declarations rather than from uses.</summary>
+public sealed record SymbolEdge(ISymbol From, ISymbol To, string Kind);
+
+public sealed class SymbolExtraction
+{
+    /// <summary>Symbols in declaration order, every container before its members.</summary>
+    public List<SymbolRow> Symbols { get; } = new();
+    /// <summary>inherits, implements, and overrides edges.</summary>
+    public List<SymbolEdge> Edges { get; } = new();
+}
+
+/// <summary>
+/// Walks the symbols declared by a compilation's assembly (namespaces, types, members), producing one row per
+/// symbol with a location for every declaration, so a partial type is one symbol with several locations.
+/// </summary>
 public sealed class SymbolExtractor
 {
     private readonly Compilation _compilation;
+    private IReadOnlyDictionary<SyntaxTree, FileRef> _files = new Dictionary<SyntaxTree, FileRef>();
+    private Dictionary<long, bool> _generatedByFile = new();
+    private SymbolExtraction _result = new();
+
     public SymbolExtractor(Compilation compilation) => _compilation = compilation;
 
-    public List<SymbolRow> Extract(IEnumerable<Document> documents)
+    /// <param name="files">The syntax trees that belong to indexed files. Declarations elsewhere are ignored.</param>
+    public SymbolExtraction Extract(IReadOnlyDictionary<SyntaxTree, FileRef> files)
     {
-        var rows = new List<SymbolRow>();
-        foreach (var doc in documents)
-        {
-            var tree = doc.GetSyntaxTreeAsync().Result;
-            if (tree is null) continue;
-            var model = _compilation.GetSemanticModel(tree);
-            var root = tree.GetRoot();
-            var isGenerated = DetectGenerated(root);
-
-            var typeDecls = root.DescendantNodes()
-                .OfType<BaseTypeDeclarationSyntax>()
-                .Concat<MemberDeclarationSyntax>(root.DescendantNodes().OfType<NamespaceDeclarationSyntax>())
-                .Concat<MemberDeclarationSyntax>(root.DescendantNodes().OfType<FileScopedNamespaceDeclarationSyntax>());
-
-            foreach (var decl in typeDecls)
-                ExtractFromDeclaration(decl, model, null, rows, isGenerated);
-        }
-        return rows;
+        _files = files;
+        _generatedByFile = files.Values.GroupBy(f => f.FileId).ToDictionary(g => g.Key, g => g.First().IsGenerated);
+        _result = new SymbolExtraction();
+        VisitNamespace(_compilation.Assembly.GlobalNamespace, null);
+        return _result;
     }
 
-    private void ExtractFromDeclaration(MemberDeclarationSyntax decl, SemanticModel model, long? containerId, List<SymbolRow> rows, bool fileGenerated)
+    private void VisitNamespace(INamespaceSymbol ns, string? containerKey)
     {
-        var symbol = model.GetDeclaredSymbol(decl);
-        if (symbol is null || symbol.IsImplicitlyDeclared) return;
-        var kind = GetSymbolKind(symbol);
-        if (kind == "namespace") return;
-        // Skip property/event accessor methods (they have their own symbols already).
-        if (symbol is IMethodSymbol method && method.MethodKind is MethodKind.PropertyGet or MethodKind.PropertySet or MethodKind.EventAdd or MethodKind.EventRemove)
-            return;
-        var isGenerated = fileGenerated || HasGeneratedAttribute(symbol);
-        var fullName = GetFullName(symbol);
+        foreach (var child in ns.GetNamespaceMembers())
+        {
+            string? key = containerKey;
+            var row = TryCreateRow(child, containerKey);
+            if (row is not null)
+            {
+                _result.Symbols.Add(row);
+                key = row.Key;
+            }
+            VisitNamespace(child, key);
+        }
 
-        rows.Add(new SymbolRow
+        foreach (var type in ns.GetTypeMembers())
+            VisitType(type, containerKey);
+    }
+
+    private void VisitType(INamedTypeSymbol type, string? containerKey)
+    {
+        if (type.IsImplicitlyDeclared) return;
+        var row = TryCreateRow(type, containerKey);
+        if (row is null) return;
+        _result.Symbols.Add(row);
+        AddTypeEdges(type);
+
+        foreach (var member in type.GetMembers())
+        {
+            if (member is INamedTypeSymbol nested)
+            {
+                VisitType(nested, row.Key);
+                continue;
+            }
+            if (member.IsImplicitlyDeclared) continue;
+            if (member is IMethodSymbol method && SymbolFacts.IsAccessor(method)) continue;
+
+            var memberRow = TryCreateRow(member, row.Key);
+            if (memberRow is null) continue;
+            _result.Symbols.Add(memberRow);
+            AddMemberEdges(member);
+        }
+
+        AddInterfaceImplementationEdges(type);
+    }
+
+    private SymbolRow? TryCreateRow(ISymbol symbol, string? containerKey)
+    {
+        var locations = new List<SymbolLocation>();
+        foreach (var reference in symbol.DeclaringSyntaxReferences)
+        {
+            if (!_files.TryGetValue(reference.SyntaxTree, out var file)) continue;
+            var span = reference.GetSyntax().GetLocation().GetLineSpan();
+            locations.Add(new SymbolLocation
+            {
+                FileId = file.FileId,
+                StartLine = span.StartLinePosition.Line + 1,
+                StartColumn = span.StartLinePosition.Character + 1,
+                EndLine = span.EndLinePosition.Line + 1,
+                EndColumn = span.EndLinePosition.Character + 1,
+            });
+        }
+        if (locations.Count == 0) return null;
+
+        // Prefer a hand-written declaration as the primary one, then the earliest file.
+        var primary = locations
+            .OrderBy(l => _generatedByFile[l.FileId])
+            .ThenBy(l => l.FileId)
+            .ThenBy(l => l.StartLine)
+            .First();
+        primary.IsPrimary = true;
+
+        return new SymbolRow
         {
             Key = SymbolKey.For(symbol),
-            Kind = kind,
+            Kind = SymbolFacts.Kind(symbol),
             Name = symbol.Name,
-            FullName = fullName,
-            ContainerId = containerId,
-            Signature = GetSignature(symbol),
-            Accessibility = symbol.DeclaredAccessibility.ToString().ToLowerInvariant(),
-            StartLine = decl.GetLocation().GetLineSpan().StartLinePosition.Line + 1,
-            EndLine = decl.GetLocation().GetLineSpan().EndLinePosition.Line + 1,
-            DocSummary = ExtractSummary(symbol.GetDocumentationCommentXml()),
-            IsGenerated = isGenerated,
-        });
+            FullName = SymbolFacts.FullName(symbol),
+            ContainerKey = containerKey,
+            Signature = SymbolFacts.Signature(symbol),
+            Accessibility = SymbolFacts.Accessibility(symbol),
+            DocSummary = SymbolFacts.DocSummary(symbol),
+            IsGenerated = _generatedByFile[primary.FileId] || HasGeneratedAttribute(symbol),
+            Locations = locations,
+        };
+    }
 
-        if (symbol is INamedTypeSymbol namedType)
+    // ---- declaration-level relationships -------------------------------------------------------
+
+    /// <summary>Every class, struct, enum, and delegate has one of these as an implicit base; an edge to it says nothing.</summary>
+    private static bool IsImplicitBase(INamedTypeSymbol type) => type.SpecialType is
+        SpecialType.System_Object or SpecialType.System_ValueType or SpecialType.System_Enum
+        or SpecialType.System_MulticastDelegate or SpecialType.System_Delegate;
+
+    private void AddTypeEdges(INamedTypeSymbol type)
+    {
+        var baseType = type.BaseType;
+        if (baseType is not null && !IsImplicitBase(baseType))
+            _result.Edges.Add(new SymbolEdge(type, baseType.OriginalDefinition, "inherits"));
+
+        foreach (var iface in type.Interfaces)
+            _result.Edges.Add(new SymbolEdge(type, iface.OriginalDefinition, "implements"));
+    }
+
+    private void AddMemberEdges(ISymbol member)
+    {
+        ISymbol? overridden = member switch
         {
-            foreach (var member in namedType.GetMembers())
+            IMethodSymbol m => m.OverriddenMethod,
+            IPropertySymbol p => p.OverriddenProperty,
+            IEventSymbol e => e.OverriddenEvent,
+            _ => null,
+        };
+        if (overridden is not null)
+            _result.Edges.Add(new SymbolEdge(member, overridden.OriginalDefinition, "overrides"));
+
+        IEnumerable<ISymbol> explicitImpls = member switch
+        {
+            IMethodSymbol m => m.ExplicitInterfaceImplementations,
+            IPropertySymbol p => p.ExplicitInterfaceImplementations,
+            IEventSymbol e => e.ExplicitInterfaceImplementations,
+            _ => Array.Empty<ISymbol>(),
+        };
+        foreach (var impl in explicitImpls)
+            _result.Edges.Add(new SymbolEdge(member, impl.OriginalDefinition, "implements"));
+    }
+
+    /// <summary>
+    /// For every interface the type declares (and the interfaces those extend), links each interface member to the
+    /// member that implements it, wherever that member is declared (the type or a base class).
+    /// </summary>
+    private void AddInterfaceImplementationEdges(INamedTypeSymbol type)
+    {
+        foreach (var declared in type.Interfaces)
+        {
+            foreach (var iface in new[] { declared }.Concat(declared.AllInterfaces))
             {
-                if (member.IsImplicitlyDeclared || member is INamespaceSymbol) continue;
-                // Nested types are reached by the type walk; counting them here would emit them twice.
-                if (member is INamedTypeSymbol) continue;
-                // For a partial type, GetMembers() returns members of every part; keep only this part's.
-                var syn = member.DeclaringSyntaxReferences.FirstOrDefault(r => r.SyntaxTree == decl.SyntaxTree);
-                if (syn is null) continue;
-                var mkind = GetSymbolKind(member);
-                if (mkind == "namespace") continue;
-                // Skip property/event accessor methods.
-                if (member is IMethodSymbol m && m.MethodKind is MethodKind.PropertyGet or MethodKind.PropertySet or MethodKind.EventAdd or MethodKind.EventRemove)
-                    continue;
-                var mg = isGenerated || HasGeneratedAttribute(member);
-                var memberFullName = GetFullName(member);
-                var span = syn.GetSyntax().GetLocation().GetLineSpan();
-                int sl = span.StartLinePosition.Line + 1;
-                int el = span.EndLinePosition.Line + 1;
-                rows.Add(new SymbolRow
+                foreach (var ifaceMember in iface.GetMembers())
                 {
-                    Key = SymbolKey.For(member),
-                    Kind = mkind,
-                    Name = member.Name,
-                    FullName = memberFullName,
-                    Signature = GetSignature(member),
-                    Accessibility = member.DeclaredAccessibility.ToString().ToLowerInvariant(),
-                    StartLine = sl,
-                    EndLine = el,
-                    DocSummary = ExtractSummary(member.GetDocumentationCommentXml()),
-                    IsGenerated = mg,
-                });
+                    if (ifaceMember is IMethodSymbol m && SymbolFacts.IsAccessor(m)) continue;
+                    if (ifaceMember is not (IMethodSymbol or IPropertySymbol or IEventSymbol)) continue;
+
+                    var impl = type.FindImplementationForInterfaceMember(ifaceMember);
+                    if (impl is null || impl.IsImplicitlyDeclared) continue;
+                    // Explicit implementations are linked from the member itself (AddMemberEdges).
+                    if (impl is IMethodSymbol { ExplicitInterfaceImplementations.Length: > 0 }
+                        or IPropertySymbol { ExplicitInterfaceImplementations.Length: > 0 }
+                        or IEventSymbol { ExplicitInterfaceImplementations.Length: > 0 })
+                        continue;
+
+                    _result.Edges.Add(new SymbolEdge(impl.OriginalDefinition, ifaceMember.OriginalDefinition, "implements"));
+                }
             }
         }
     }
 
-    /// <summary>
-    /// Build a fully qualified name that always includes the containing type, e.g.
-    /// "global::SimpleLib.Calculator.Add" for a method.
-    /// </summary>
-    private static string GetFullName(ISymbol symbol)
-    {
-        if (symbol.ContainingType is not null)
-        {
-            var typeFull = symbol.ContainingType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-            return typeFull + "." + symbol.Name;
-        }
-        return symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-    }
-
-    private static string GetSymbolKind(ISymbol symbol) => symbol switch
-    {
-        INamespaceSymbol => "namespace",
-        INamedTypeSymbol t when t.TypeKind == TypeKind.Class => "class",
-        INamedTypeSymbol t when t.TypeKind == TypeKind.Struct => "struct",
-        INamedTypeSymbol t when t.TypeKind == TypeKind.Interface => "interface",
-        INamedTypeSymbol t when t.TypeKind == TypeKind.Enum => "enum",
-        IMethodSymbol => "method",
-        IPropertySymbol => "property",
-        IFieldSymbol => "field",
-        IEventSymbol => "event",
-        _ => "other",
-    };
-
-    private static string? GetSignature(ISymbol symbol)
-    {
-        try { return symbol.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat); }
-        catch { return null; }
-    }
-
-    private static string? ExtractSummary(string? docXml)
-    {
-        if (string.IsNullOrEmpty(docXml)) return null;
-        try { return XDocument.Parse(docXml).Descendants("summary").FirstOrDefault()?.Value?.Trim(); }
-        catch { return null; }
-    }
+    // ---- generated code ------------------------------------------------------------------------
 
     private static bool HasGeneratedAttribute(ISymbol symbol) =>
         symbol.GetAttributes().Any(a =>
-            a.AttributeClass?.Name is "GeneratedCodeAttribute" or "CompilerGeneratedCodeAttribute");
+            a.AttributeClass?.Name is "GeneratedCodeAttribute" or "CompilerGeneratedAttribute");
 
     public static bool DetectGenerated(SyntaxNode root)
     {
@@ -148,9 +235,9 @@ public sealed class SymbolExtractor
             if (trivia.IsKind(SyntaxKind.SingleLineCommentTrivia) || trivia.IsKind(SyntaxKind.MultiLineCommentTrivia))
             {
                 var t = trivia.ToString();
-                if (t.Contains("<auto-generated>") || t.Contains("auto-generated") ||
-                    t.Contains("Autogenerated") || t.Contains("auto_generated") ||
-                    t.Contains("<autogenerated") || t.Contains("<auto-generated"))
+                if (t.Contains("auto-generated", StringComparison.OrdinalIgnoreCase) ||
+                    t.Contains("autogenerated", StringComparison.OrdinalIgnoreCase) ||
+                    t.Contains("auto_generated", StringComparison.OrdinalIgnoreCase))
                     return true;
             }
         }
@@ -158,33 +245,20 @@ public sealed class SymbolExtractor
     }
 
     /// <summary>
-    /// Check if a file path indicates generated code (by convention).
+    /// Whether a file name indicates generated code by convention: "*.g.cs", "*.g.i.cs", "*.generated.cs",
+    /// "*.Designer.cs", gRPC output ("*Grpc.cs"), and the build's own AssemblyInfo/AssemblyAttributes/GlobalUsings.
     /// </summary>
     public static bool IsGeneratedFilePath(string? filePath)
     {
         if (string.IsNullOrEmpty(filePath)) return false;
         var name = Path.GetFileName(filePath);
         return name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
-               name.EndsWith(".Grpc.cs", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".g.i.cs", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".Designer.cs", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith("Grpc.cs", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("AssemblyAttributes", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("AssemblyInfo", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("GlobalUsings", StringComparison.OrdinalIgnoreCase);
     }
-}
-
-public sealed class SymbolRow
-{
-    public long? Id { get; set; }
-    public long? FileId { get; set; }
-    public required string Key { get; init; }
-    public required string Kind { get; init; }
-    public required string Name { get; init; }
-    public required string FullName { get; init; }
-    public long? ContainerId { get; set; }
-    public string? Signature { get; init; }
-    public string? Accessibility { get; init; }
-    public int StartLine { get; init; }
-    public int EndLine { get; init; }
-    public string? DocSummary { get; init; }
-    public bool IsGenerated { get; init; }
 }

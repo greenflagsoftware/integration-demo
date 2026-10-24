@@ -11,7 +11,8 @@ public static class SymbolKey
     public static string For(ISymbol symbol)
     {
         var def = symbol.OriginalDefinition;
-        var assembly = def.ContainingAssembly?.Name ?? "";
+        // A namespace spans assemblies, so its key carries no assembly.
+        var assembly = def is INamespaceSymbol ? "" : def.ContainingAssembly?.Name ?? "";
         var id = def.GetDocumentationCommentId();
         if (id is null)
         {

@@ -122,6 +122,10 @@ public sealed class SemanticsIndex : IDisposable
     /// <summary>The expected "File.cs:line" entry for a marker.</summary>
     public string At(string fileName, string marker) => $"{fileName}:{Line(fileName, marker)}";
 
+    public long Scalar(string sql, params (string Name, object Value)[] args) => Query<long>(sql, args).Single();
+
+    public List<string> Strings(string sql, params (string Name, object Value)[] args) => Query<string>(sql, args);
+
     // ---- plumbing ------------------------------------------------------------------------------
 
     private List<T> Query<T>(string sql, params (string Name, object Value)[] args)
