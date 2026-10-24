@@ -39,10 +39,14 @@ public sealed class IndexEngine
                 db.SetMeta("git_commit", gitCommit);
 
                 db.BeginTransaction();
+                var total = System.Diagnostics.Stopwatch.StartNew();
                 await WriteIndexAsync(db, loadResult, solutionName, solutionRelPath, indexedAt, result);
+                result.Timings["references"] = total.Elapsed - result.Timings["files and symbols"];
+                total.Restart();
                 db.RebuildFtsIndex();
                 db.CommitTransaction();
                 db.Checkpoint();
+                result.Timings["finish"] = total.Elapsed;
             }
 
             DeleteDatabaseFiles(fullDbPath);
@@ -134,6 +138,7 @@ public sealed class IndexEngine
         var projectPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Pass 1: projects, files, declared symbols.
+        var phase = System.Diagnostics.Stopwatch.StartNew();
         foreach (var project in loadResult.IndexableProjects)
         {
             var roslynProject = project.RoslynProject!;
@@ -219,7 +224,7 @@ public sealed class IndexEngine
                 result.FilesIndexed++;
 
                 if (syntaxTree is null) continue;
-                files[syntaxTree] = new FileRef(fileId, isGenerated);
+                files[syntaxTree] = new FileRef(fileId, isGenerated, fileRelPath);
                 projectWork.Trees.Add((syntaxTree, fileId));
             }
 
@@ -231,6 +236,9 @@ public sealed class IndexEngine
                 WriteSymbol(row);
             projectWork.Edges = extraction.Edges;
         }
+
+        result.Timings["files and symbols"] = phase.Elapsed;
+        phase.Restart();
 
         // Pass 2: relationships and references, once every declared symbol has an id.
         foreach (var item in work)
@@ -259,8 +267,26 @@ public sealed class IndexEngine
                 result.ReferencesExtracted += refs.Count;
                 result.EdgesExtracted += edges.Count;
             }
+
+            if (extractor.ErrorCounts.Count > 0)
+            {
+                var total = extractor.ErrorCounts.Values.Sum();
+                var top = string.Join(", ", extractor.ErrorCounts.OrderByDescending(kv => kv.Value).Take(4).Select(kv => $"{kv.Key} x{kv.Value}"));
+                var diagnostic = new DiagnosticEntry
+                {
+                    Severity = Models.DiagnosticSeverity.Warning,
+                    Message = $"Project '{item.Project.Name}' has {total} compile error(s) in {extractor.FilesWithErrors} file(s) ({top}). " +
+                              "Names involved could not be resolved, so references through them are missing from the index. " +
+                              "Usually a missing restore, project reference, or generated file.",
+                    ProjectPath = item.Project.FilePath,
+                };
+                result.Diagnostics.Add(diagnostic);
+                db.InsertDiagnostic(diagnostic, db.GetProjectIdByPath(PathUtil.ToRepoRelative(_repoRoot, item.Project.FilePath)), null);
+            }
         }
     }
+
+    // (pass 2 timing is recorded by the caller, which also times the finish)
 
     /// <summary>Whether a used-but-not-indexed symbol is worth a stub row.</summary>
     private static bool CanStub(ISymbol symbol) => symbol switch
@@ -332,5 +358,7 @@ public sealed class IndexResult
     public int ReferencesExtracted { get; set; }
     public int EdgesExtracted { get; set; }
     public int ExternalSymbolsIndexed { get; set; }
+    /// <summary>Wall-clock time per phase: "files and symbols", "references", "finish" (FTS, commit, move).</summary>
+    public Dictionary<string, TimeSpan> Timings { get; } = new();
     public List<DiagnosticEntry> Diagnostics { get; init; } = new();
 }

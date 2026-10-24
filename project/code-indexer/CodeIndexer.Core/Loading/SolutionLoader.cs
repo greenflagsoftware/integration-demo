@@ -16,6 +16,9 @@ public sealed class SolutionLoader
 {
     private static readonly object RegisterLock = new();
 
+    /// <summary>Which SDK's MSBuild was registered and why, once <see cref="RegisterMsBuild"/> has run.</summary>
+    public static string? RegisteredSdkDescription { get; private set; }
+
     /// <summary>
     /// Registers an MSBuild instance. If a global.json governs <paramref name="solutionDirectory"/>, the SDK it
     /// pins (subject to its rollForward policy) is used; otherwise the highest installed SDK. Has no effect
@@ -45,6 +48,9 @@ public sealed class SolutionLoader
             }
 
             MSBuildLocator.RegisterInstance(instances.First(i => i.Version == chosenVersion));
+            RegisteredSdkDescription = pinned is null
+                ? $"{chosenVersion} (highest installed; no global.json found)"
+                : $"{chosenVersion} (global.json pins {pinned.Value.Pin.Version}, rollForward {pinned.Value.Pin.RollForward}: {pinned.Value.Path})";
         }
     }
 
@@ -242,6 +248,8 @@ public sealed class SolutionLoader
     public static void PrintSummary(SolutionLoadResult result)
     {
         Console.WriteLine($"Solution: {result.SolutionPath}");
+        if (RegisteredSdkDescription is not null)
+            Console.WriteLine($".NET SDK: {RegisteredSdkDescription}");
         Console.WriteLine($"Projects: {result.Projects.Count} total, " +
                           $"{result.LoadedProjectCount} loaded, " +
                           $"{result.ExcludedProjectCount} excluded");

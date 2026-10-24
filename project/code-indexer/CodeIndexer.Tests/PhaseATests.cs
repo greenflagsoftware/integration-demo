@@ -46,6 +46,12 @@ public class ProjectFilterTests
     public void Default_DoesNotExcludeNamesThatMerelyContainTest(string name) =>
         Assert.True(new ProjectFilter().ShouldInclude(name));
 
+    [Theory]
+    [InlineData("Google.Cloud.Speech.V1.GeneratedSnippets")]
+    [InlineData("Google.Cloud.Speech.V1.Snippets")]
+    public void Default_ExcludesSnippetProjects(string name) =>
+        Assert.False(new ProjectFilter().ShouldInclude(name));
+
     [Fact]
     public void Exclude_AlwaysWins()
     {
@@ -111,6 +117,19 @@ public class SdkSelectorTests
     {
         Assert.Null(SdkSelector.TryParse("""{ "msbuild-sdks": { } }"""));
         Assert.Null(SdkSelector.TryParse("not json"));
+    }
+}
+
+public class RegisteredSdkTests
+{
+    [Fact]
+    public async Task AfterLoading_TheChosenSdkAndTheReasonAreReported()
+    {
+        await new SolutionLoader().LoadAsync(Fixtures.SimpleClassLib);
+
+        var description = SolutionLoader.RegisteredSdkDescription;
+        Assert.NotNull(description);
+        Assert.Matches(@"^\d+\.\d+\.\d+ \((highest installed|global\.json pins)", description);
     }
 }
 
@@ -256,6 +275,43 @@ public class SymbolIdentityTests
 
         Assert.Equal(2, type.Primary.FileId);
         Assert.False(type.IsGenerated);
+    }
+
+    [Fact]
+    public void Extractor_PartialType_PrefersThePartInTheFileNamedAfterIt()
+    {
+        // StorageClient.CopyObject.cs sorts before StorageClient.cs and is declared first, but StorageClient.cs is
+        // the main part.
+        var (docA, docB, compilation) = Compile(
+            "public partial class Widget { public void Small() { } }",
+            "public partial class Widget { public void Main1() { } public void Main2() { } }");
+        var files = new Dictionary<SyntaxTree, FileRef>
+        {
+            [docA.GetSyntaxTreeAsync().Result!] = new FileRef(1, false, "src/Widget.Small.cs"),
+            [docB.GetSyntaxTreeAsync().Result!] = new FileRef(2, false, "src/Widget.cs"),
+        };
+
+        var type = new SymbolExtractor(compilation).Extract(files).Symbols.Single(r => r.Name == "Widget");
+
+        Assert.Equal(2, type.Primary.FileId);
+    }
+
+    [Fact]
+    public void Extractor_PartialType_WithoutANamedPart_PrefersTheLongerBody()
+    {
+        var (docA, docB, compilation) = Compile(
+            "public partial class Widget { }",
+            "public partial class Widget { public void A() { } public void B() { } }");
+        var files = new Dictionary<SyntaxTree, FileRef>
+        {
+            [docA.GetSyntaxTreeAsync().Result!] = new FileRef(1, false, "src/One.cs"),
+            [docB.GetSyntaxTreeAsync().Result!] = new FileRef(2, false, "src/Two.cs"),
+        };
+
+        var type = new SymbolExtractor(compilation).Extract(files).Symbols.Single(r => r.Name == "Widget");
+
+        Assert.Equal(1, type.Locations.Count(l => l.IsPrimary));
+        Assert.Equal(type.Locations.OrderByDescending(l => l.EndLine - l.StartLine).First().FileId, type.Primary.FileId);
     }
 
     [Fact]

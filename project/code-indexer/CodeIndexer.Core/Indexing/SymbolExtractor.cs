@@ -4,7 +4,7 @@ using Microsoft.CodeAnalysis.CSharp;
 namespace CodeIndexer.Core.Indexing;
 
 /// <summary>A source file known to the database, as seen by the extractor.</summary>
-public sealed record FileRef(long FileId, bool IsGenerated);
+public sealed record FileRef(long FileId, bool IsGenerated, string Path = "");
 
 public sealed class SymbolLocation
 {
@@ -53,6 +53,7 @@ public sealed class SymbolExtractor
     private readonly Compilation _compilation;
     private IReadOnlyDictionary<SyntaxTree, FileRef> _files = new Dictionary<SyntaxTree, FileRef>();
     private Dictionary<long, bool> _generatedByFile = new();
+    private Dictionary<long, string> _paths = new();
     private SymbolExtraction _result = new();
 
     public SymbolExtractor(Compilation compilation) => _compilation = compilation;
@@ -62,6 +63,7 @@ public sealed class SymbolExtractor
     {
         _files = files;
         _generatedByFile = files.Values.GroupBy(f => f.FileId).ToDictionary(g => g.Key, g => g.First().IsGenerated);
+        _paths = files.Values.GroupBy(f => f.FileId).ToDictionary(g => g.Key, g => g.First().Path);
         _result = new SymbolExtraction();
         VisitNamespace(_compilation.Assembly.GlobalNamespace, null);
         return _result;
@@ -130,9 +132,13 @@ public sealed class SymbolExtractor
         }
         if (locations.Count == 0) return null;
 
-        // Prefer a hand-written declaration as the primary one, then the earliest file.
+        // The primary declaration of a partial type: hand-written before generated, then the part that sits in the
+        // file named after the symbol (StorageClient.cs for StorageClient, not StorageClient.CopyObject.cs), then the
+        // part with the longest body, then the earliest file.
         var primary = locations
             .OrderBy(l => _generatedByFile[l.FileId])
+            .ThenBy(l => IsNamedAfter(symbol, l.FileId) ? 0 : 1)
+            .ThenByDescending(l => l.EndLine - l.StartLine)
             .ThenBy(l => l.FileId)
             .ThenBy(l => l.StartLine)
             .First();
@@ -151,6 +157,13 @@ public sealed class SymbolExtractor
             IsGenerated = _generatedByFile[primary.FileId] || HasGeneratedAttribute(symbol),
             Locations = locations,
         };
+    }
+
+    private bool IsNamedAfter(ISymbol symbol, long fileId)
+    {
+        if (!_paths.TryGetValue(fileId, out var path) || path.Length == 0) return false;
+        var stem = Path.GetFileNameWithoutExtension(path.Replace('\\', '/'));
+        return stem.Equals(symbol.Name, StringComparison.Ordinal);
     }
 
     // ---- declaration-level relationships -------------------------------------------------------

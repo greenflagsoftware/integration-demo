@@ -99,7 +99,9 @@ indexCommand.SetHandler(async (FileInfo solution, string db, string[] include, s
     var filter = new ProjectFilter();
     foreach (var inc in include) filter.Include(inc);
     foreach (var exc in exclude) filter.Exclude(exc);
+    var timer = System.Diagnostics.Stopwatch.StartNew();
     var loadResult = await new SolutionLoader(filter).LoadAsync(solution.FullName);
+    var loadTime = timer.Elapsed;
     SolutionLoader.PrintSummary(loadResult);
 
     var dbPath = db;
@@ -115,6 +117,8 @@ indexCommand.SetHandler(async (FileInfo solution, string db, string[] include, s
     var result = await engine.IndexSolutionAsync(dbPath, loadResult);
     Console.WriteLine($"Indexed: {result.ProjectsIndexed} projects, {result.FilesIndexed} files, {result.SymbolsIndexed} symbols " +
                       $"(+{result.ExternalSymbolsIndexed} external), {result.ReferencesExtracted} references, {result.EdgesExtracted} edges");
+    Console.WriteLine("Time: load " + loadTime.TotalSeconds.ToString("F1") + "s, " +
+                      string.Join(", ", result.Timings.Select(t => $"{t.Key} {t.Value.TotalSeconds:F1}s")));
     foreach (var d in result.Diagnostics)
         Console.WriteLine($"  [diag] {d}");
 }, solutionArg, dbOption, includeOption, excludeOption);

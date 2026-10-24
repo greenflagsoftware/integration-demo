@@ -13,7 +13,7 @@ public sealed class ProjectFilter
     private static readonly string[] DefaultExcludePatterns =
     {
         "test", "tests", "*.test", "*.tests", "*.integrationtests", "*.unittests",
-        "*.snippets", "*.benchmarks", "*.benchmarkingtool", "*.cleantestdata",
+        "*.snippets", "*.generatedsnippets", "*.benchmarks", "*.benchmarkingtool", "*.cleantestdata",
     };
 
     private readonly List<Regex> _includePatterns = new();

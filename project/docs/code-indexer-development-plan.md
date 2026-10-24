@@ -8,7 +8,7 @@ small, structured, trustworthy answers.
 The indexer is a **standalone, general-purpose code-intelligence tool**. It knows nothing about any
 consumer (workflow engines, mocking, personas). Consumers build on its queries.
 
-Status: **Revised plan (2026-10-24), after a code review. Phases A, B, C, and D are done.** Phases 0-3 of the first plan produced a working
+Status: **Revised plan (2026-10-24), after a code review. Phases A, B, C, D, and E are done.** Phases 0-3 of the first plan produced a working
 skeleton (42 tests pass) but the extraction and storage layers have correctness gaps that defeat the
 purpose (section 7). The revised phases fix those before adding features.
 
@@ -294,14 +294,59 @@ The full response shapes are in `docs\code-indexer-output-contract.md`.
   `find-symbol` substring matching can be broad on short names (use `--kind`/`--project`); staleness does not see
   files added after indexing.
 
-### Phase E: Prove it on real code
-**Outcome:** reliable and fast on the reference SDK.
-- [ ] Index `Google.Cloud.Storage.V1.sln` and `Google.Cloud.Speech.V1` with the pinned SDK 8.0.426;
-      spot-check 20 known symbols for correct definition, references, and callers against the IDE.
-- [ ] Verify multi-TFM handling and generated-code flags on real files.
-- [ ] Benchmarks and targets (for example full index of one API in minutes, any query under 100 ms);
-      tune SQLite pragmas, batching, indexes.
-- [ ] Partial results with diagnostics when some projects fail to load.
+### Phase E: Prove it on real code (done 2026-10-24)
+**Outcome:** reliable and fast on the reference SDK. Measured on the fork at `E:\Dev\demos\g-api\google-cloud-dotnet`
+(git HEAD 57936cbb), SDK 8.0.426 selected from its `global.json`, Release build, this machine. The fork was only
+read; `git status` stayed clean.
+
+| API | Projects indexed | Files | Symbols (+external) | References | Edges | Index time | Peak memory | Database |
+|---|---|---|---|---|---|---|---|---|
+| `Google.Cloud.Storage.V1` (REST wrapper, 25-part partial classes) | 5 | 199 | 6,240 (+1,655) | 42,964 | 11,485 | 23 s | not sampled | 12 MB |
+| `Google.Cloud.Speech.V1` (gRPC, 84% of symbols generated) | 3 | 35 | 2,107 (+703) | 13,218 | 3,658 | 12 s | not sampled | 4 MB |
+| `Google.Cloud.PubSub.V1` (large gRPC) | 3 | 68 | 5,070 (+897) | 36,760 | 9,773 | 19 s | 335 MB | n/a |
+| `Google.Cloud.Firestore`, **not restored** | 3 | 113 | 4,322 (+252) | 17,513 | 2,305 | 15 s | n/a | n/a |
+
+Where the time goes (Storage): load the solution with MSBuild 7.5 s, files and symbols 5.4 s, references 10.0 s,
+finish 0.1 s. The index command prints these.
+- [x] **Indexed with the pinned SDK:** the summary now prints which SDK was registered and why (for the fork:
+      `8.0.426 (global.json pins 8.0.426, rollForward latestMinor)`; with no `global.json`, the highest installed).
+      This verifies F11 end to end.
+- [x] **Accuracy, checked against `grep` of the source as an independent oracle (more than 20 symbols):**
+  - 42 uniquely named methods (the 14 most-called in each of Storage, Speech, PubSub): the index's call-site count
+    equals the source in every case once the oracle's own blind spots are accounted for. Those were: BCL methods
+    that share a name (`Add`, `Clear`, `AsReadOnly`), `partial void` declarations that look like calls, and a call
+    on a line that also contains a modifier keyword. In each case the index was the one that was right.
+  - `StorageClient`: 25 locations, exactly the 25 `partial class StorageClient` declarations in the source.
+  - Type relationships: `StorageClient` has one subtype (`StorageClientImpl`), whose supertypes are `StorageClient`
+    then `IDisposable`; the implementations of `IBlobSigner`, `ISupportsRange` and `IPostPolicyCondition` match the
+    class declarations, including the transitive `IExactMatch` case.
+  - gRPC: the generated `Speech.SpeechClient` derives from `Grpc.Core.ClientBase<T>` (external, flagged), and the
+    GAPIC `SpeechClientImpl` derives from `SpeechClient`; callees of `SpeechClientImpl.Recognize` are the call
+    wrapper and the request-modifier hook.
+- [x] **Multi-TFM and generated code on real files:** `netstandard2.0;net462` and `net8.0;net462` projects are
+      indexed once on the primary TFM, with an Info diagnostic; `*.g.cs` and `*Grpc.g.cs` are flagged generated
+      (Speech: 11 of the 13 library source files). No reference assemblies for `net462` were needed.
+- [x] **Fixes the real code forced:**
+  - The main part of a partial type is its primary location (the file named after the type, then the longest
+    part): `StorageClient` now points at `StorageClient.cs:44`, not `StorageClient.CopyObject.cs`.
+  - `*.GeneratedSnippets` is excluded by default (Speech indexed a 68-file snippets project).
+  - Type outline did a full table scan per member (446 ms for a 25-part class); `symbols(container_id)` is now
+    indexed (7 ms).
+- [x] **Trust signals:** each project's compile errors are counted while binding and stored as a warning with the
+      top error ids. Storage has 3 errors in one file (`CS9258`, `CS9273`, `CS1503`: newer-language-feature
+      constructs the Roslyn version here binds differently); unrestored Firestore reports 8,352 and 19,611 errors
+      plus the exact `dotnet restore` command per project, and still finishes with partial results.
+- [x] **Query speed:** in-process, every query is under 12 ms on the Storage index (find-symbol 11 ms because of
+      substring matching; call hierarchy to depth 3 about 5 ms; refs, definition, hierarchy, outline under 1 ms,
+      type outline 7 ms). Cold open plus first query is about 45 ms and the staleness check (a stat per file) 3 ms.
+      A CLI call takes about 265 ms wall-clock; a bare `--version` already takes 158 ms, so the host start-up is the
+      floor. A ReadyToRun publish brings a query to about 215 ms. Source-generated JSON was tried and measured at
+      about 5 ms, which is noise, so it was reverted.
+- [ ] Targets not yet exercised: an API an order of magnitude larger (Compute.V1 is 1.2 million lines; AIPlatform
+      554,000) because they are not restored in the fork and restoring would write to it. Run `dotnet restore` there
+      first and re-measure; the phase timings above show where to look.
+- Possible later speed-ups (not needed at this size): bind files in parallel in the reference pass (the writer and
+  the external-stub resolver would need a lock), and a long-lived `serve` mode to avoid per-call process start-up.
 
 ### Phase F: Incremental indexing and freshness
 - [ ] Hash comparison; reindex changed files and their dependents (document the dependency rule).
@@ -310,7 +355,8 @@ The full response shapes are in `docs\code-indexer-output-contract.md`.
 - [ ] `--watch` optional and deferrable.
 
 ### Phase G: Packaging and agent ergonomics
-- [ ] `dotnet tool` packaging; README with PowerShell examples; consistent, short `--help` text.
+- [ ] `dotnet tool` packaging, published ReadyToRun (a query goes from about 265 ms to about 215 ms; the .NET host
+      start-up is the rest); README with PowerShell examples; consistent, short `--help` text.
 - [ ] Decide on a `serve` mode (stdio JSON) and/or an MCP wrapper.
 - [ ] CI workflow running the xUnit suite.
 

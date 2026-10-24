@@ -897,6 +897,40 @@ public class OutputFormatTests : QueryCommandTestBase
     }
 
     [Fact]
+    public void EveryCommandsResponse_SerializesToJsonAndTable()
+    {
+        // Serialization is source-generated; a response type missing from QueryJsonContext throws at run time.
+        IQueryResponse[] responses =
+        {
+            Q.FindSymbol("Calculator"),
+            Q.Search("calculator"),
+            Q.Definition(Doc(AddInt)),
+            Q.Show(Doc(AddInt), includeSource: true),
+            Q.Outline(Name("Calculator.cs")),
+            Q.At("Calculator.cs", Ix.Line("Calculator.cs", "add-int")),
+            Q.Refs(Doc(AddInt)),
+            Q.Callers(Doc(AddInt)),
+            Q.Callees(Name("SumAreas")),
+            Q.Implementations(Name("IShape")),
+            Q.Hierarchy(Name("IShape")),
+        };
+
+        foreach (var response in responses)
+        {
+            using var json = JsonDocument.Parse(response.ToJson());
+            Assert.True(json.RootElement.TryGetProperty("command", out _));
+            Assert.False(string.IsNullOrWhiteSpace(response.ToTable()));
+        }
+    }
+
+    [Fact]
+    public void ContainerIndex_Exists()
+    {
+        // Without it a type outline scans every symbol once per member (446 ms for a 25-part class).
+        Assert.Equal(1, Ix.Scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_symbols_container'"));
+    }
+
+    [Fact]
     public void Table_ShowsAHeaderTargetAndRows()
     {
         var table = Q.Refs(Doc(AddInt)).ToTable();

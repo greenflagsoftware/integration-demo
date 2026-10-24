@@ -41,6 +41,10 @@ public sealed class ReferenceExtractor
     private readonly Resolve _resolve;
     private readonly Lookup _lookup;
 
+    /// <summary>Compile errors seen while binding, by diagnostic id, across every tree extracted so far.</summary>
+    public Dictionary<string, int> ErrorCounts { get; } = new();
+    public int FilesWithErrors { get; private set; }
+
     private SemanticModel _model = null!;
     private long _fileId;
     private List<ReferenceRow> _refs = null!;
@@ -78,7 +82,24 @@ public sealed class ReferenceExtractor
                     break;
             }
         }
+        CountErrors();
         return (_refs, _edges);
+    }
+
+    /// <summary>
+    /// Compile errors mean some names could not be bound, so references through them are missing from the index.
+    /// Counting them lets the caller say how far to trust a project's results.
+    /// </summary>
+    private void CountErrors()
+    {
+        bool any = false;
+        foreach (var d in _model.GetDiagnostics())
+        {
+            if (d.Severity != DiagnosticSeverity.Error) continue;
+            ErrorCounts[d.Id] = ErrorCounts.GetValueOrDefault(d.Id) + 1;
+            any = true;
+        }
+        if (any) FilesWithErrors++;
     }
 
     // ---- names ---------------------------------------------------------------------------------

@@ -20,6 +20,7 @@ public static class DatabaseSchema
         "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);",
         "CREATE INDEX IF NOT EXISTS idx_symbols_full_name ON symbols(full_name);",
         "CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);",
+        "CREATE INDEX IF NOT EXISTS idx_symbols_container ON symbols(container_id);",
         "CREATE INDEX IF NOT EXISTS idx_files_project_id ON files(project_id);",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_project_path ON files(project_id, path);",
         "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);",
