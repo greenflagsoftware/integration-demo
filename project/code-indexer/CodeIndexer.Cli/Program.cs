@@ -83,9 +83,14 @@ Command Query(string name, string description, Argument? arg, Action<Command>? c
             var table = string.Equals(ctx.ParseResult.GetValueForOption(formatOption), "table", StringComparison.OrdinalIgnoreCase);
             Console.WriteLine(table ? response.ToTable() : response.ToJson());
         }
+        catch (InvalidOperationException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            ctx.ExitCode = 3;
+        }
         catch (SqliteException ex)
         {
-            Console.Error.WriteLine($"Query failed: {ex.Message}. If the index was built by an older version, re-run 'codeindex index'.");
+            Console.Error.WriteLine($"Query failed: {ex.Message.TrimEnd('.')}. If the index was built by an older version, re-run 'codeindex index'.");
             ctx.ExitCode = 3;
         }
     });

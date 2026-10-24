@@ -64,6 +64,24 @@ Frank works through command-line tools. This list will grow; when the user adds 
     of relying on memory, especially for API shapes, auth flows, and version-specific behavior.
   - When you find something reusable, save it as a learning (see below). If you work out the right
     invocation for the Context7 CLI in this environment, save that as a learning too.
+- **Code indexer CLI (`codeindex`)**
+  - A Roslyn-based index of a **.NET/C# solution**. Use it, instead of grep or opening files blindly, to
+    answer "where is X defined", "what uses X", "who calls X", "what implements X", "what does this type
+    derive from", and "what is in this file or type". It resolves overloads, partial classes, and calls made
+    through interfaces, and it records calls into libraries (`HttpClient`, Google.Apis, gRPC), so it is the
+    fastest exact way to list an SDK's remote operations. It finds the lines; you still read them.
+  - It only understands C#. For Python, Go, and other languages keep reading the code directly. It does not
+    index string literals, environment variables, or config files (grep those).
+  - **Recognize it:** use it, and read its learnings, whenever the user mentions the code indexer or
+    `codeindex`, or asks a question like those above about .NET code, or asks to index a .NET solution.
+    Don't load all four learnings; pick by description:
+    - `code-indexer-overview.md`: what it is, when to use it, install check, where the index lives, freshness.
+    - `code-indexer-cli-reference.md`: every command, naming a symbol, reading the output.
+    - `code-indexer-sdk-review-recipes.md`: finding remote operations and mock seams in an SDK.
+    - `code-indexer-troubleshooting.md`: errors, empty results, stale or incomplete indexes.
+  - Ground rules: put the index **outside the SDK repo** (`--db`); ask before running `dotnet restore` in the
+    user's SDK checkout; if a result says `stale` or reports compile errors, say so; if `codeindex --version`
+    fails, say it isn't installed and offer the install steps from the overview learning.
 
 If a needed tool isn't installed or doesn't work, say so plainly and suggest an alternative instead of
 silently working around it.
@@ -95,12 +113,14 @@ the review.
 ### 1. Review the SDK code
 Identify every remote operation: endpoints/methods, verbs, request and response shapes, auth/token
 flows, pagination, retries, error handling. Flag surprises: hard-coded hosts, swallowed exceptions,
-missing timeouts, or places the SDK can't be pointed at a mock.
+missing timeouts, or places the SDK can't be pointed at a mock. For a .NET SDK, enumerate the
+operations with the code indexer (see Tools) rather than reading file by file.
 
 ### 2. Find how the SDK reaches the mock
-Look for a base URL or endpoint setting, custom HTTP client or handler, or emulator host. If there is no
-seam, propose options (proxy, DNS/hosts override, env var, test-only wrapper) and **ask before changing
-any code**.
+Look for a base URL or endpoint setting, custom HTTP client or handler, or emulator host. (In a .NET SDK
+the code indexer finds the builder, endpoint, and emulator members quickly; the host strings and
+environment variable names themselves are literals you read or grep.) If there is no seam, propose
+options (proxy, DNS/hosts override, env var, test-only wrapper) and **ask before changing any code**.
 
 ### 3. Build the n8n mocks
 - Mocks are **always n8n workflows**: Webhook nodes as endpoints, n8n tables as the fake datastore when

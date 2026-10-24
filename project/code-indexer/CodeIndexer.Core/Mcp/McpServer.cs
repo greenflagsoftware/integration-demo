@@ -116,13 +116,13 @@ public sealed class McpServer
             using var queries = new SymbolQueries(db);   // opened per call so staleness is always current
             return Result(id, ToolResult(tool.Run(arguments, queries).ToJson(), isError: false));
         }
-        catch (ArgumentException ex)
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
             return Result(id, ToolResult(ex.Message, isError: true));
         }
         catch (Microsoft.Data.Sqlite.SqliteException ex)
         {
-            return Result(id, ToolResult($"Query failed: {ex.Message}. If the index was built by an older version, re-run 'codeindex index'.", isError: true));
+            return Result(id, ToolResult($"Query failed: {ex.Message.TrimEnd('.')}. If the index was built by an older version, re-run 'codeindex index'.", isError: true));
         }
     }
 

@@ -78,6 +78,32 @@ public class CliTests
     }
 
     [Fact]
+    public void AnIndexFromAnOlderVersion_IsExitCode3_WithAMessageSayingHowToFixIt()
+    {
+        var db = Fixtures.TempDbPath();
+        try
+        {
+            Assert.Equal(0, Execute("index", Fixtures.Semantics, "--db", db).ExitCode);
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={db};Pooling=False"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE meta SET value = '5' WHERE key = 'schema_version'";
+                cmd.ExecuteNonQuery();
+            }
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+            var run = Execute("find-symbol", "Calculator", "--db", db);
+
+            Assert.Equal(3, run.ExitCode);
+            Assert.Contains("older version of the tool", run.Err);
+            Assert.Contains("codeindex index", run.Err);
+            Assert.DoesNotContain("no such table", run.Err);
+        }
+        finally { Fixtures.DeleteDb(db); }
+    }
+
+    [Fact]
     public void IndexThenQueryThenIndexAgain_WorksEndToEnd()
     {
         var db = Fixtures.TempDbPath();

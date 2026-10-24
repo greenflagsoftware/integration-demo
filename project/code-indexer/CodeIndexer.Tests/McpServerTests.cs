@@ -293,6 +293,34 @@ public class McpServerTests : IClassFixture<SemanticsIndex>
     }
 
     [Fact]
+    public void AnIndexFromAnOlderVersion_IsAToolErrorThatSaysToReindex()
+    {
+        var copy = Fixtures.TempDbPath();
+        try
+        {
+            File.Copy(_ix.DbPath, copy);
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={copy};Pooling=False"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE meta SET value = '5' WHERE key = 'schema_version'";
+                cmd.ExecuteNonQuery();
+            }
+            var line = new JsonObject
+            {
+                ["jsonrpc"] = "2.0", ["id"] = 1, ["method"] = "tools/call",
+                ["params"] = new JsonObject { ["name"] = "find_symbol", ["arguments"] = new JsonObject { ["name"] = "x" } },
+            }.ToJsonString();
+
+            var result = new McpServer(defaultDb: copy).HandleLine(line)!["result"]!;
+
+            Assert.True(result["isError"]!.GetValue<bool>());
+            Assert.Contains("older version of the tool", result["content"]![0]!["text"]!.GetValue<string>());
+        }
+        finally { Fixtures.DeleteDb(copy); }
+    }
+
+    [Fact]
     public void AStaleIndex_IsReportedInTheToolResult()
     {
         var copy = Fixtures.TempDbPath();

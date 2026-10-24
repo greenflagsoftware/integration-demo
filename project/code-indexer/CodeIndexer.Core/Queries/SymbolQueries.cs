@@ -27,7 +27,29 @@ public sealed partial class SymbolQueries : IDisposable
         };
         _connection = new SqliteConnection(builder.ConnectionString);
         _connection.Open();
+        CheckSchema();
         _repoRoot = GetMeta("repo_root");
+    }
+
+    /// <summary>An index written by another version of the tool has a different layout; say so instead of failing on a missing table.</summary>
+    private void CheckSchema()
+    {
+        string? stored;
+        try { stored = GetMeta("schema_version"); }
+        catch (SqliteException)
+        {
+            _connection.Dispose();
+            throw new InvalidOperationException($"'{_dbPath}' is not a CodeIndexer index. Run 'codeindex index <solution>' to create one.");
+        }
+
+        if (!int.TryParse(stored, out var version) || version != Storage.DatabaseSchema.SchemaVersion)
+        {
+            _connection.Dispose();
+            throw new InvalidOperationException(
+                $"This index was built by an {(version < Storage.DatabaseSchema.SchemaVersion ? "older" : "newer")} version of the tool " +
+                $"(index format {stored ?? "unknown"}, this tool reads format {Storage.DatabaseSchema.SchemaVersion}). " +
+                "Re-run 'codeindex index <solution>' to rebuild it.");
+        }
     }
 
     public (string name, string path, string indexedAt, string commit) GetSolutionContext()
