@@ -10,6 +10,8 @@ public sealed class ReferenceRow
     public long FileId { get; set; }
     public int Line { get; set; }
     public int Column { get; set; }
+    /// <summary>Width of the referenced token in characters, so a position can be matched to the reference.</summary>
+    public int Length { get; set; } = 1;
     public string Kind { get; set; } = "use";
     /// <summary>The member (or type) whose body or declaration contains the reference, when it is an indexed symbol.</summary>
     public long? EnclosingSymbolId { get; set; }
@@ -98,7 +100,7 @@ public sealed class ReferenceExtractor
         var enclosing = Enclosing(name);
         foreach (var kind in Classify(name, symbol))
         {
-            Add(name.GetLocation(), id.Value, kind, enclosing, symbol);
+            Add(name.GetLocation(), name.Identifier.Span.Length, id.Value, kind, enclosing, symbol);
             if (kind == "call" && symbol is IMethodSymbol && enclosing is not null)
                 _edges.Add(new EdgeRow { FromSymbolId = enclosing.Value, ToSymbolId = id.Value, Kind = "calls" });
         }
@@ -212,7 +214,7 @@ public sealed class ReferenceExtractor
         var enclosing = Enclosing(creation);
         // `new Foo()` already records the type name as a use; only add a row where no type name exists.
         if (explicitConstructor || creation is ImplicitObjectCreationExpressionSyntax)
-            Add(creation.GetLocation(), id.Value, "create", enclosing, target);
+            Add(creation.GetLocation(), creation.GetFirstToken().Span.Length, id.Value, "create", enclosing, target);
         if (enclosing is not null)
             _edges.Add(new EdgeRow { FromSymbolId = enclosing.Value, ToSymbolId = id.Value, Kind = "creates" });
     }
@@ -225,7 +227,7 @@ public sealed class ReferenceExtractor
         if (id is null) return;
 
         var enclosing = Enclosing(initializer);
-        Add(initializer.ThisOrBaseKeyword.GetLocation(), id.Value, "call", enclosing, constructor.OriginalDefinition);
+        Add(initializer.ThisOrBaseKeyword.GetLocation(), initializer.ThisOrBaseKeyword.Span.Length, id.Value, "call", enclosing, constructor.OriginalDefinition);
         if (enclosing is not null)
             _edges.Add(new EdgeRow { FromSymbolId = enclosing.Value, ToSymbolId = id.Value, Kind = "calls" });
     }
@@ -238,7 +240,7 @@ public sealed class ReferenceExtractor
 
         var enclosing = Enclosing(access);
         foreach (var kind in AccessKinds(access, indexer))
-            Add(access.ArgumentList.OpenBracketToken.GetLocation(), id.Value, kind, enclosing, indexer.OriginalDefinition);
+            Add(access.ArgumentList.OpenBracketToken.GetLocation(), 1, id.Value, kind, enclosing, indexer.OriginalDefinition);
     }
 
     // ---- the enclosing member ------------------------------------------------------------------
@@ -269,7 +271,7 @@ public sealed class ReferenceExtractor
         return null;
     }
 
-    private void Add(Location location, long symbolId, string kind, long? enclosing, ISymbol target)
+    private void Add(Location location, int length, long symbolId, string kind, long? enclosing, ISymbol target)
     {
         var start = location.GetLineSpan().StartLinePosition;
         _refs.Add(new ReferenceRow
@@ -278,6 +280,7 @@ public sealed class ReferenceExtractor
             FileId = _fileId,
             Line = start.Line + 1,
             Column = start.Character + 1,
+            Length = Math.Max(1, length),
             Kind = kind,
             EnclosingSymbolId = enclosing,
             ReferenceName = SymbolFacts.FullName(target),

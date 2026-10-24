@@ -26,6 +26,9 @@ public sealed class SemanticsIndex : IDisposable
 {
     private readonly string _dbPath;
     private readonly string _fixtureDir;
+
+    public string DbPath => _dbPath;
+    public CodeIndexer.Core.Queries.SymbolQueries Queries() => new(_dbPath);
     public SqliteConnection Conn { get; }
 
     public SemanticsIndex()
@@ -117,6 +120,14 @@ public sealed class SemanticsIndex : IDisposable
         var args = kind is null ? new[] { ("@s", (object)symbolId) } : new[] { ("@s", (object)symbolId), ("@k", (object)kind) };
         var raw = Query<string>(sql, args);
         return new SortedSet<string>(raw.Select(x => x.Substring(x.LastIndexOf('/') + 1)), StringComparer.Ordinal);
+    }
+
+    /// <summary>1-based column of the first occurrence of <paramref name="text"/> on the marked line.</summary>
+    public int Column(string fileName, string marker, string text)
+    {
+        var file = Directory.EnumerateFiles(_fixtureDir, fileName, SearchOption.AllDirectories)
+            .Single(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}"));
+        return File.ReadAllLines(file)[Line(fileName, marker) - 1].IndexOf(text, StringComparison.Ordinal) + 1;
     }
 
     /// <summary>The expected "File.cs:line" entry for a marker.</summary>

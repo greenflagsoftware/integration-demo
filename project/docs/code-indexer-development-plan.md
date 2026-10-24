@@ -8,7 +8,7 @@ small, structured, trustworthy answers.
 The indexer is a **standalone, general-purpose code-intelligence tool**. It knows nothing about any
 consumer (workflow engines, mocking, personas). Consumers build on its queries.
 
-Status: **Revised plan (2026-10-24), after a code review. Phases A, B, and C are done.** Phases 0-3 of the first plan produced a working
+Status: **Revised plan (2026-10-24), after a code review. Phases A, B, C, and D are done.** Phases 0-3 of the first plan produced a working
 skeleton (42 tests pass) but the extraction and storage layers have correctness gaps that defeat the
 purpose (section 7). The revised phases fix those before adding features.
 
@@ -259,23 +259,40 @@ Each phase ends with something usable and tested. Check items off as work comple
   queries should exclude generated files by default; `find-symbol`/`outline`/`search` still join to files, so
   namespaces and external stubs are invisible to them until Phase D surfaces them.
 
-### Phase D: Query layer and CLI
-**Outcome:** commands an agent can chain without ambiguity.
-- [ ] Symbol selectors (`--id`, `--key`, `file:line:col`, name) on every symbol-taking command; ambiguous
-      names return candidates with ids and keys and a warning. Every symbol payload includes `id` and `key`.
-- [ ] `definition` and a position lookup `at <file>:<line>:<col>` (the symbol under a position).
-- [ ] `refs`: filter by reference kind and by file/project, optional one-line source context, grouped
-      output option.
-- [ ] `callers`/`callees`: include call-site file/line, `--depth` (fix: `0` currently returns nothing though
-      help says "no limit"), `truncated` flag, and `--through-dispatch` to expand interface/virtual calls.
-- [ ] `implementations` for interfaces, abstract/virtual members, and base classes; `hierarchy` with
-      explicit supertype/subtype directions.
-- [ ] `outline` for a type or file, ordered and nested by `container_id`.
-- [ ] Compute `stale` from content hashes on every query (today it is never set); list changed files.
-- [ ] Update `docs\code-indexer-output-contract.md` to cover all commands (Phase 3 commands are missing),
-      the new `id`/`key` fields, and the candidates shape. `--format table` actually implemented (the
-      option is currently accepted and ignored).
-- [ ] Tests for each command against the Phase B fixture.
+### Phase D: Query layer and CLI (done 2026-10-24)
+**Outcome:** commands an agent can chain without ambiguity. Schema version 5. Suite: 233 passing.
+The full response shapes are in `docs\code-indexer-output-contract.md`.
+- [x] **Selectors:** every symbol-taking command accepts `--id`, `--key` (or a bare documentation id), a
+      `file:line[:col]` position, or a name (full name, simple name, `Container.Member`, generic arguments ignored,
+      `--kind` to narrow). A name matching several symbols returns `candidates` (with ids and keys) and a warning
+      instead of an arbitrary first hit; hand-written beats generated, indexed beats external. Every symbol
+      payload carries `id`, `key`, and `is_external`.
+- [x] **`definition` and `at`:** `definition` lists every declaration location (a partial type has one per part);
+      `at file:line[:col]` returns the symbol used at a position (with reference kind and enclosing member), else the
+      innermost declaration containing it. References now store the token length so a column can be matched.
+- [x] **`refs`:** `--ref-kind`, `--file`, `--project`, `--context` (source line), `--group-by file|member|kind`,
+      limit/offset with `total_matches`; references in generated files are hidden by default with a count.
+- [x] **`callers`/`callees`:** call sites per node, `--depth` (0 = unlimited; was returning nothing), `truncated`,
+      `--through-dispatch` (callers of an override see calls made via its interface and base members; callees of a
+      call to an interface member list the implementers), `--include-creates`, `--include-external`,
+      `--exclude-generated`. Property/field/event "callers" return a hint to use `refs`. (F18)
+- [x] **`implementations` and `hierarchy`:** works for types and for members (implements/overrides), direct or
+      `--transitive`; hierarchy has explicit `supertypes` and `subtypes` trees, shows external supertypes flagged as
+      such, and takes `--direction`/`--depth`.
+- [x] **`outline`:** a file outline nests symbols by container and places them by where they are declared in that
+      file (a partial type lists only that part's members); a type outline lists its members.
+- [x] **Staleness (F15):** computed on every query by comparing size and modification time with the file on disk and
+      hashing only on a mismatch; `stale`, `stale_files`, and a leading warning in every response. Index time
+      records size and mtime and now hashes the file's bytes. Proven end to end by editing a file after indexing.
+- [x] **`--format table` (F19):** implemented for every command (tables, key/value blocks, indented trees).
+- [x] CLI: database defaults to the only indexed solution; exit codes 2 (no index) and 3 (query failed); a
+      consistent selector option set; `search` and `find-symbol` can include generated and external symbols.
+- [x] Output contract rewritten for all commands; tests for each command against the Semantics fixture, plus
+      selector parsing, staleness (changed, touched-only, missing), JSON shape, and table output.
+- Known limits: call sites on a node are those of the first path that reached it; name selectors for members of
+  generic types need the type name without arguments (`Repository.Add`) and operators are not nameable;
+  `find-symbol` substring matching can be broad on short names (use `--kind`/`--project`); staleness does not see
+  files added after indexing.
 
 ### Phase E: Prove it on real code
 **Outcome:** reliable and fast on the reference SDK.
@@ -340,7 +357,7 @@ Tests: 42/42 pass, but the fixture is a single 54-line file with no in-project c
 | F3 | Partial classes: members come from `GetMembers()` (all parts) and are attributed to every part's file with the first part's lines | Read | Phase C (done) |
 | F4 | Nested types are inserted twice (as members and by the type walk) | Read | Phase A (done) |
 | F5 | References cover only method/constructor bodies via `a.b` and invocations; no type usages, accessors, initializers, attributes, bare identifiers. `refs Calculator` returned nothing on the fixture | **Confirmed** (types), Read (rest) | Phase C (done) |
-| F6 | Calls through an interface are not linked to implementations; callers of an implementation miss interface calls | Read | Phase C (done: edges); D (queries expand dispatch) |
+| F6 | Calls through an interface are not linked to implementations; callers of an implementation miss interface calls | Read | Phase C (done: edges); D (done: --through-dispatch) |
 | F7 | Generic method calls and ambiguous overload resolution are not handled (`GetSymbolInfo(...).Symbol` only) | Read | Phase C (done) |
 | F8 | References to symbols outside the index are discarded (`SymbolId > 0` filter) | Read | Phase C (done) |
 | F9 | Loader reads the TFM from XML but does not filter Roslyn projects; multi-targeted projects may be indexed once per TFM under the same path | Read (verify on Google) | Phase A (done); verify on Google in E |
@@ -349,11 +366,11 @@ Tests: 42/42 pass, but the fixture is a single 54-line file with no in-project c
 | F12 | Call/refs/callers tests assert only `NotNull`; fixture has no resolved in-project calls, so call edges and caller queries are effectively untested (confirmed: `callers`, `callees`, `refs` all return empty on the fixture) | **Confirmed** | Phase B (done: fixture and goldens; 14 pending tests track C/D) |
 | F13 | `diagnostics` table exists but is never written | Read | Phase A (done) |
 | F14 | Git commit read by parsing `.git/HEAD` (breaks with worktrees/packed refs) | Read | Phase A (done) |
-| F15 | Emitted paths use `\` separators on Windows; `stale` is always `false` because it is never computed | **Confirmed** | Phase A (done: paths); D (`stale`) |
+| F15 | Emitted paths use `\` separators on Windows; `stale` is always `false` because it is never computed | **Confirmed** | Phase A (done: paths); D (done: stale) |
 | F16 | Per-row uncached commands; FTS rebuilt with `INSERT OR REPLACE` into an external-content table | Read | Phase A (done; measure in E) |
 | F17 | `container_id` is never set; namespaces and delegates are not indexed though the contract lists `namespace` | Read | Phase C (done) |
-| F18 | `callers --depth 0` returns nothing although help says "0 = no limit"; `callers`/`callees` never set `truncated` | Read | Phase D |
-| F19 | `--format` is accepted but ignored on every command | Read | Phase D |
+| F18 | `callers --depth 0` returns nothing although help says "0 = no limit"; `callers`/`callees` never set `truncated` | Read | Phase D (done) |
+| F19 | `--format` is accepted but ignored on every command | Read | Phase D (done) |
 | F20 | `IsGeneratedFilePath` matches `.Grpc.cs`; the Google files are named like `SpeechGrpc.cs` | Read | Phase C (done) |
 
 ---

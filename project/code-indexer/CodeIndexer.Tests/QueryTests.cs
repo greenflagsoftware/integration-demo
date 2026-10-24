@@ -4,204 +4,102 @@ using CodeIndexer.Core.Queries;
 
 namespace CodeIndexer.Tests;
 
+/// <summary>
+/// Smoke tests of the query layer against the small SimpleClassLib fixture (one interface, three classes).
+/// The behavior of each command is asserted in depth against the Semantics fixture in QueryCommandTests.
+/// </summary>
 public class QueryTests : IDisposable
 {
-    private static readonly string FixtureSolutionPath = Path.GetFullPath(
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "tests", "Fixtures", "SimpleClassLib", "SimpleClassLib.sln"));
-
     private readonly string _dbPath;
-    private readonly string _repoRoot;
 
     public QueryTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"codeindex_query_{Guid.NewGuid():N}.db");
-        _repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", ".."));
-
-        // Build index first.
-        var filter = new ProjectFilter().Include("SimpleLib");
-        var loader = new SolutionLoader(filter);
-        var loadResult = loader.LoadAsync(FixtureSolutionPath).GetAwaiter().GetResult();
-        var engine = new IndexEngine(_repoRoot);
-        engine.IndexSolutionAsync(_dbPath, loadResult).GetAwaiter().GetResult();
+        _dbPath = Fixtures.TempDbPath();
+        var loader = new SolutionLoader(new ProjectFilter().Include("SimpleLib"));
+        var loadResult = loader.LoadAsync(Fixtures.SimpleClassLib).GetAwaiter().GetResult();
+        new IndexEngine(Fixtures.RepoRoot).IndexSolutionAsync(_dbPath, loadResult).GetAwaiter().GetResult();
     }
 
-    public void Dispose()
-    {
-        try { GC.Collect(); GC.WaitForPendingFinalizers(); } catch { }
-        try { File.Delete(_dbPath + "-wal"); } catch { }
-        try { File.Delete(_dbPath + "-shm"); } catch { }
-        try { File.Delete(_dbPath); } catch { }
-    }
+    public void Dispose() => Fixtures.DeleteDb(_dbPath);
+
+    private static SymbolSelector Name(string text) => new(Text: text);
 
     [Fact]
-    public void FindSymbol_ExactMatch_ReturnsSymbol()
+    public void FindSymbol_ExactMatch_ComesFirst()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.FindSymbol("Calculator", null, null, false, 10, 0);
+        var result = queries.FindSymbol("Calculator", new FindOptions(Limit: 10));
 
         Assert.Equal("find-symbol", result.Command);
-        Assert.NotEmpty(result.Data);
-        Assert.Contains(result.Data, s => s.Name == "Calculator");
+        Assert.Equal("Calculator", result.Data[0].Name);
         Assert.Equal("class", result.Data[0].Kind);
-    }
-
-    [Fact]
-    public void FindSymbol_PrefixMatch_ReturnsMultiple()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.FindSymbol("Calc", null, null, false, 10, 0);
-
-        Assert.NotEmpty(result.Data);
-        Assert.Contains(result.Data, s => s.Name == "Calculator");
         Assert.Contains(result.Data, s => s.Name == "ICalculator");
     }
 
     [Fact]
-    public void FindSymbol_FilterByKind_ReturnsOnlyMatchingKind()
+    public void FindSymbol_Prefix_FindsBothTheClassAndTheInterface()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.FindSymbol("Add", "method", null, false, 10, 0);
+        var names = queries.FindSymbol("Calc").Data.Select(s => s.Name).ToList();
 
+        Assert.Contains("Calculator", names);
+        Assert.Contains("ICalculator", names);
+    }
+
+    [Fact]
+    public void FindSymbol_FilterByKind_ReturnsOnlyThatKind()
+    {
+        using var queries = new SymbolQueries(_dbPath);
+        var result = queries.FindSymbol("Add", new FindOptions(Kind: "method"));
+
+        Assert.Equal(2, result.Data.Count);
         Assert.All(result.Data, s => Assert.Equal("method", s.Kind));
     }
 
     [Fact]
-    public void FindSymbol_ExcludesGeneratedByDefault()
+    public void Outline_File_NestsMembersUnderTheirTypes()
     {
         using var queries = new SymbolQueries(_dbPath);
-        // Generated files contain "assembly" attributes, etc.
-        var result = queries.FindSymbol("assembly", null, null, false, 10, 0);
+        var result = queries.Outline(Name("Class1.cs"));
 
-        Assert.DoesNotContain(result.Data, s => s.IsGenerated);
-    }
-
-    [Fact]
-    public void FindSymbol_IncludesGeneratedWhenFlagSet()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-
-        // Without flag: only non-generated.
-        var without = queries.FindSymbol("add", null, null, false, 10, 0);
-        // With flag: should include at least as many.
-        var with = queries.FindSymbol("add", null, null, true, 10, 0);
-
-        Assert.True(with.Data.Count >= without.Data.Count);
-    }
-
-    [Fact]
-    public void FindSymbol_LimitRespected()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.FindSymbol("a", null, null, false, 3, 0);
-
-        Assert.True(result.Data.Count <= 3);
-    }
-
-    [Fact]
-    public void FindSymbol_OffsetSkipsResults()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var all = queries.FindSymbol("a", null, null, false, 20, 0);
-        var skipped = queries.FindSymbol("a", null, null, false, 20, 2);
-
-        Assert.True(all.Data.Count >= 2);
-        if (all.Data.Count > 2)
-        {
-            Assert.Equal(all.Data[2].Name, skipped.Data[0].Name);
-        }
-    }
-
-    [Fact]
-    public void FindSymbol_Truncated_WhenMoreThanLimit()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.FindSymbol("a", null, null, true, 1, 0);
-
-        // Should have exactly 1 symbol and be marked truncated.
-        Assert.True(result.Data.Count <= 1);
-    }
-
-    [Fact]
-    public void Outline_ReturnsFileAndSymbols()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Outline("Class1.cs");
-
-        Assert.NotNull(result.Data);
-        Assert.Contains("Class1.cs", result.Data.FilePath);
+        Assert.EndsWith("Class1.cs", result.Data.FilePath);
         Assert.True(result.Data.LineCount > 0);
-        Assert.NotEmpty(result.Data.Symbols);
+        var calculator = Flatten(result.Data.Symbols).Single(n => n.Name == "Calculator");
+        Assert.Equal(new[] { "Add", "MultiplyAsync", "Subtract" }, calculator.Children.Select(c => c.Name));
     }
 
     [Fact]
-    public void Show_ReturnsSymbolDetails()
+    public void Show_ReturnsTheSymbol_AndItsSourceOnRequest()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Show("Calculator", false);
 
-        Assert.NotNull(result.Data.Symbol);
-        Assert.Equal("Calculator", result.Data.Symbol.Name);
-        Assert.Equal("class", result.Data.Symbol.Kind);
+        var plain = queries.Show(Name("Calculator"));
+        Assert.Equal("class", plain.Data.Symbol.Kind);
+        Assert.Null(plain.Data.SourceCode);
+
+        var withSource = queries.Show(Name("Calculator"), includeSource: true);
+        Assert.Contains("public class Calculator", withSource.Data.SourceCode);
     }
 
     [Fact]
-    public void Show_WithSource_ReturnsCode()
+    public void Show_UnknownSymbol_IsAWarning_NotAnException()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Show("Calculator", true);
+        var result = queries.Show(Name("NonExistentSymbol_XYZZY"));
 
-        Assert.NotNull(result.Data.SourceCode);
-        Assert.Contains("public class Calculator", result.Data.SourceCode);
-    }
-
-    [Fact]
-    public void Show_UnknownSymbol_ReturnsFallback()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Show("NonExistentSymbol_XYZZY", false);
-
-        Assert.Equal("unknown", result.Data.Symbol.Kind);
         Assert.Equal(0, result.TotalCount);
+        Assert.Contains("not found", result.Warnings![0]);
+        Assert.Null(result.Target);
     }
 
     [Fact]
-    public void Search_ReturnsMatchingSymbols()
+    public void Search_FindsSymbolsByFullText()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Search("calculator", false, 10);
+        var result = queries.Search("calculator");
 
-        Assert.NotEmpty(result.Data);
         Assert.Contains(result.Data, h => h.Name == "Calculator");
-    }
-
-    [Fact]
-    public void Search_ExcludesGeneratedByDefault()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Search("assembly", false, 10);
-
-        Assert.DoesNotContain(result.Data, h => h.IsGenerated);
-    }
-
-    [Fact]
-    public void Search_IncludesGeneratedWhenFlagSet()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-
-        // With includeGenerated=true, should return at least as many results as without.
-        var without = queries.Search("a", false, 50);
-        var with = queries.Search("a", true, 50);
-
-        Assert.True(with.Data.Count >= without.Data.Count);
-    }
-
-    [Fact]
-    public void Search_RespectsLimit()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Search("a", false, 3);
-
-        Assert.True(result.Data.Count <= 3);
+        Assert.All(result.Data, h => Assert.False(h.IsExternal));
     }
 
     [Fact]
@@ -212,99 +110,56 @@ public class QueryTests : IDisposable
 
         Assert.Equal("SimpleClassLib", name);
         Assert.NotEmpty(indexedAt);
-        Assert.NotEmpty(commit);
-    }
-
-    // ──────────────── Phase 3 tests ────────────────
-
-    [Fact]
-    public void Refs_KnownSymbol_ReturnsEnvelope()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Refs("ICalculator", 100);
-
-        // Envelope only: what refs should contain is asserted by SemanticsGoldenTests against the index.
-        Assert.Equal("refs", result.Command);
-        Assert.Equal("SimpleClassLib", result.SolutionName);
-        Assert.Equal(result.Data.Count, result.TotalCount);
-        Assert.False(result.Truncated);
-        Assert.Null(result.Warnings);
+        Assert.Matches("^[0-9a-f]{40}$", commit);
     }
 
     [Fact]
-    public void Refs_UnknownSymbol_ReturnsWarning()
+    public void Implementations_OfInterface_IncludeTheClass()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Refs("NonExistent", 100);
+        var result = queries.Implementations(Name("ICalculator"));
 
-        Assert.Empty(result.Data);
-        Assert.NotNull(result.Warnings);
-        Assert.Contains("not found", result.Warnings[0]);
+        var impl = Assert.Single(result.Data);
+        Assert.Equal("Calculator", impl.Symbol.Name);
+        Assert.Equal("implements", impl.Relation);
     }
 
     [Fact]
-    public void Callers_OfSymbolWithNoCallers_IsEmptyEnvelope()
+    public void Hierarchy_OfClass_ShowsTheInterfaceAsASupertype()
     {
         using var queries = new SymbolQueries(_dbPath);
-        // Nothing in the fixture calls the ICalculator type itself.
-        var result = queries.Callers("ICalculator", 1, 50);
+        var result = queries.Hierarchy(Name("Calculator"));
 
-        Assert.Equal("callers", result.Command);
-        Assert.Empty(result.Data);
-        Assert.Null(result.Warnings);
+        Assert.Contains(result.Data.Supertypes, n => n.Symbol.Name == "ICalculator" && n.Relation == "implements");
+        Assert.Empty(result.Data.Subtypes);
     }
 
     [Fact]
-    public void Callees_OfMethodWithNoIndexedCallees_IsEmptyEnvelope()
+    public void Refs_Callers_Callees_OnASymbolNothingCalls_AreEmptyWithoutWarnings()
     {
         using var queries = new SymbolQueries(_dbPath);
-        // Subtract calls nothing.
-        var result = queries.Callees("global::SimpleLib.Calculator.Subtract", 1, 50);
 
-        Assert.Equal("callees", result.Command);
-        Assert.Empty(result.Data);
-        Assert.Null(result.Warnings);
+        var refs = queries.Refs(Name("Subtract"));
+        var callers = queries.Callers(Name("Subtract"));
+        var callees = queries.Callees(Name("Subtract"));
+
+        Assert.Empty(refs.Data.References);
+        Assert.Empty(callers.Data);
+        Assert.Empty(callees.Data);
+        Assert.Equal("Subtract", callers.Target!.Name);
     }
 
     [Fact]
-    public void Implementations_ReturnsImplementers()
+    public void Callees_OfDataService_ListsTheExternalCallOnlyWhenAsked()
     {
         using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Implementations("ICalculator", 50);
 
-        Assert.NotEmpty(result.Data);
-        Assert.Contains(result.Data, i => i.Name == "Calculator");
-        Assert.Equal("class", result.Data[0].Kind);
+        Assert.Empty(queries.Callees(Name("GetDataAsync")).Data);
+
+        var withExternal = queries.Callees(Name("GetDataAsync"), new CallOptions(IncludeExternal: true));
+        Assert.Contains(withExternal.Data, c => c.Symbol.Name == "GetAsync" && c.Symbol.IsExternal);
     }
 
-    [Fact]
-    public void Implementations_UnknownInterface_ReturnsWarning()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Implementations("INonExistent", 50);
-
-        Assert.Empty(result.Data);
-        Assert.NotNull(result.Warnings);
-    }
-
-    [Fact]
-    public void Hierarchy_ShowsImplementsEdge()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Hierarchy("Calculator", 3);
-
-        Assert.Equal("hierarchy", result.Command);
-        Assert.NotEmpty(result.Data.Children);
-        Assert.Contains(result.Data.Children, c => c.Name == "ICalculator" && c.EdgeKind == "implements");
-    }
-
-    [Fact]
-    public void Hierarchy_UnknownType_ReturnsWarning()
-    {
-        using var queries = new SymbolQueries(_dbPath);
-        var result = queries.Hierarchy("NonExistentType", 3);
-
-        Assert.NotNull(result.Warnings);
-        Assert.Contains("not found", result.Warnings[0]);
-    }
+    private static IEnumerable<OutlineNode> Flatten(IEnumerable<OutlineNode> nodes) =>
+        nodes.SelectMany(n => new[] { n }.Concat(Flatten(n.Children)));
 }

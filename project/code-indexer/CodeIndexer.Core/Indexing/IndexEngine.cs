@@ -191,7 +191,21 @@ public sealed class IndexEngine
                     continue;
 
                 var text = await doc.GetTextAsync();
-                var contentHash = IndexDatabase.ComputeContentHash(text.ToString());
+
+                // Hash the bytes on disk (what the staleness check will hash later); source-generator output has no file.
+                string contentHash;
+                long? sizeBytes = null, modifiedTicks = null;
+                if (doc.FilePath is not null && File.Exists(doc.FilePath))
+                {
+                    contentHash = IndexDatabase.ComputeContentHash(File.ReadAllBytes(doc.FilePath));
+                    var info = new FileInfo(doc.FilePath);
+                    sizeBytes = info.Length;
+                    modifiedTicks = info.LastWriteTimeUtc.Ticks;
+                }
+                else
+                {
+                    contentHash = IndexDatabase.ComputeContentHash(text.ToString());
+                }
 
                 var syntaxTree = await doc.GetSyntaxTreeAsync();
                 var fileRelPath = doc.FilePath is not null ? PathUtil.ToRepoRelative(_repoRoot, doc.FilePath) : PathUtil.Normalize(doc.Name);
@@ -201,7 +215,7 @@ public sealed class IndexEngine
                 if (!isGenerated)
                     isGenerated = SymbolExtractor.IsGeneratedFilePath(fileRelPath);
 
-                var fileId = db.InsertFile(projectId, fileRelPath, contentHash, text.Lines.Count, isGenerated);
+                var fileId = db.InsertFile(projectId, fileRelPath, contentHash, text.Lines.Count, isGenerated, sizeBytes, modifiedTicks);
                 result.FilesIndexed++;
 
                 if (syntaxTree is null) continue;
@@ -238,7 +252,7 @@ public sealed class IndexEngine
                 var (refs, edges) = extractor.Extract(tree, fileId);
 
                 foreach (var r in refs)
-                    db.InsertReference(r.SymbolId, r.FileId, r.Line, r.Column, r.Kind, r.EnclosingSymbolId, r.ReferenceName);
+                    db.InsertReference(r.SymbolId, r.FileId, r.Line, r.Column, r.Length, r.Kind, r.EnclosingSymbolId, r.ReferenceName);
                 foreach (var e in edges)
                     db.InsertEdge(e.FromSymbolId, e.ToSymbolId, e.Kind);
 

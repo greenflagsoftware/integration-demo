@@ -95,22 +95,25 @@ public sealed class IndexDatabase : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    public static string ComputeContentHash(string text)
-    {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(text));
-        return Convert.ToHexStringLower(bytes);
-    }
+    public static string ComputeContentHash(string text) => ComputeContentHash(Encoding.UTF8.GetBytes(text));
 
-    public long InsertFile(long projectId, string relativePath, string contentHash, int lineCount, bool isGenerated)
+    /// <summary>
+    /// SHA-256 of a file's bytes. The staleness check hashes the file on disk the same way, so the two always agree.
+    /// </summary>
+    public static string ComputeContentHash(byte[] bytes) => Convert.ToHexStringLower(SHA256.HashData(bytes));
+
+    public long InsertFile(long projectId, string relativePath, string contentHash, int lineCount, bool isGenerated, long? sizeBytes = null, long? modifiedTicks = null)
     {
         var cmd = Prepared(
-            "INSERT INTO files (project_id, path, content_hash, line_count, is_generated) VALUES (@pid, @path, @hash, @lines, @gen) RETURNING id",
-            "@pid", "@path", "@hash", "@lines", "@gen");
+            "INSERT INTO files (project_id, path, content_hash, line_count, is_generated, size_bytes, modified_ticks) VALUES (@pid, @path, @hash, @lines, @gen, @size, @mtime) RETURNING id",
+            "@pid", "@path", "@hash", "@lines", "@gen", "@size", "@mtime");
         cmd.Parameters["@pid"].Value = projectId;
         cmd.Parameters["@path"].Value = relativePath;
         cmd.Parameters["@hash"].Value = contentHash;
         cmd.Parameters["@lines"].Value = lineCount;
         cmd.Parameters["@gen"].Value = isGenerated ? 1 : 0;
+        cmd.Parameters["@size"].Value = Db(sizeBytes);
+        cmd.Parameters["@mtime"].Value = Db(modifiedTicks);
         return (long)cmd.ExecuteScalar()!;
     }
 
@@ -171,15 +174,16 @@ public sealed class IndexDatabase : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    public void InsertReference(long symbolId, long fileId, int line, int column, string kind, long? enclosingSymbolId, string? referenceName)
+    public void InsertReference(long symbolId, long fileId, int line, int column, int length, string kind, long? enclosingSymbolId, string? referenceName)
     {
         var cmd = Prepared(
-            "INSERT INTO symbol_references (symbol_id, file_id, line, column, kind, enclosing_symbol_id, reference_name) VALUES (@sid, @fid, @line, @col, @kind, @enc, @rname)",
-            "@sid", "@fid", "@line", "@col", "@kind", "@enc", "@rname");
+            "INSERT INTO symbol_references (symbol_id, file_id, line, column, length, kind, enclosing_symbol_id, reference_name) VALUES (@sid, @fid, @line, @col, @len, @kind, @enc, @rname)",
+            "@sid", "@fid", "@line", "@col", "@len", "@kind", "@enc", "@rname");
         cmd.Parameters["@sid"].Value = symbolId;
         cmd.Parameters["@fid"].Value = fileId;
         cmd.Parameters["@line"].Value = line;
         cmd.Parameters["@col"].Value = column;
+        cmd.Parameters["@len"].Value = length;
         cmd.Parameters["@kind"].Value = kind;
         cmd.Parameters["@enc"].Value = Db(enclosingSymbolId);
         cmd.Parameters["@rname"].Value = Db(referenceName);
