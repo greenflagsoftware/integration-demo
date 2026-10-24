@@ -18,6 +18,17 @@ public sealed class ProjectFilter
 
     private readonly List<Regex> _includePatterns = new();
     private readonly List<Regex> _excludePatterns = new();
+    private readonly List<string> _includeText = new();
+    private readonly List<string> _excludeText = new();
+
+    /// <summary>
+    /// Identifies this filter's behavior (patterns and defaults). An index records it so a later run with a different filter
+    /// knows it cannot reuse the old index.
+    /// </summary>
+    public string Signature =>
+        $"include=[{string.Join(",", _includeText.Order(StringComparer.OrdinalIgnoreCase))}];" +
+        $"exclude=[{string.Join(",", _excludeText.Order(StringComparer.OrdinalIgnoreCase))}];" +
+        $"defaults=[{string.Join(",", DefaultExcludePatterns)}]";
     private readonly List<Regex> _defaultExcludes = DefaultExcludePatterns.Select(ToRegex).ToList();
 
     /// <summary>
@@ -27,6 +38,7 @@ public sealed class ProjectFilter
     public ProjectFilter Include(string pattern)
     {
         _includePatterns.Add(ToRegex(pattern));
+        _includeText.Add(pattern);
         return this;
     }
 
@@ -36,6 +48,7 @@ public sealed class ProjectFilter
     public ProjectFilter Exclude(string pattern)
     {
         _excludePatterns.Add(ToRegex(pattern));
+        _excludeText.Add(pattern);
         return this;
     }
 

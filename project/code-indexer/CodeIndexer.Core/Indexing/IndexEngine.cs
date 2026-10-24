@@ -8,6 +8,9 @@ namespace CodeIndexer.Core.Indexing;
 
 public sealed class IndexEngine
 {
+    /// <summary>An index written by a different tool version is rebuilt rather than updated.</summary>
+    public const string ToolVersion = "0.1.0";
+
     private readonly string _repoRoot;
     public IndexEngine(string repoRoot) => _repoRoot = repoRoot;
 
@@ -33,15 +36,11 @@ public sealed class IndexEngine
         {
             using (var db = new IndexDatabase(tempPath, _repoRoot))
             {
-                db.SetMeta("tool_version", "0.1.0");
-                db.SetMeta("indexed_at", indexedAt.ToString("O"));
-                db.SetMeta("repo_root", PathUtil.Normalize(_repoRoot));
-                db.SetMeta("git_commit", gitCommit);
+                WriteMeta(db, loadResult, solutionRelPath, indexedAt, gitCommit);
 
                 db.BeginTransaction();
                 var total = System.Diagnostics.Stopwatch.StartNew();
                 await WriteIndexAsync(db, loadResult, solutionName, solutionRelPath, indexedAt, result);
-                result.Timings["references"] = total.Elapsed - result.Timings["files and symbols"];
                 total.Restart();
                 db.RebuildFtsIndex();
                 db.CommitTransaction();
@@ -56,6 +55,91 @@ public sealed class IndexEngine
         {
             DeleteDatabaseFiles(tempPath);
             throw;
+        }
+
+        UpdateCatalog(fullDbPath, solutionName, solutionRelPath, gitCommit, indexedAt);
+        return result;
+    }
+
+    private void WriteMeta(IndexDatabase db, SolutionLoadResult loadResult, string solutionRelPath, DateTime indexedAt, string gitCommit)
+    {
+        db.SetMeta("tool_version", ToolVersion);
+        db.SetMeta("indexed_at", indexedAt.ToString("O"));
+        db.SetMeta("repo_root", PathUtil.Normalize(_repoRoot));
+        db.SetMeta("git_commit", gitCommit);
+        db.SetMeta("solution_path", solutionRelPath);
+        db.SetMeta("filter", loadResult.FilterSignature);
+        db.SetMeta("sdk_version", loadResult.SdkVersion);
+    }
+
+    /// <summary>Records what the index depends on, for every loaded project (indexed or not) and the build-wide files.</summary>
+    private void WriteInputs(IndexDatabase db, SolutionLoadResult loadResult, IEnumerable<IndexedProject> projects)
+    {
+        var projectList = projects.ToList();
+        foreach (var project in projectList)
+            foreach (var input in InputScanner.CollectProject(project, _repoRoot))
+                db.InsertInput(input);
+
+        // Build-wide files and the solution apply to all projects, so they are always recorded for the whole solution.
+        var dirs = loadResult.Projects.Select(p => Path.GetDirectoryName(p.FilePath)).OfType<string>();
+        foreach (var input in InputScanner.CollectEnvironment(loadResult.SolutionPath, dirs, _repoRoot))
+            db.InsertInput(input);
+    }
+
+    /// <summary>
+    /// Updates an existing index in place, in one transaction: the projects in <paramref name="dirtyProjects"/> are deleted
+    /// and indexed again; the projects in <paramref name="removedProjects"/> are deleted; everything else is untouched,
+    /// symbol ids included. Both sets hold repo-relative project file paths. If this throws, the transaction rolls back
+    /// and the index is as it was.
+    /// </summary>
+    public async Task<IndexResult> UpdateAsync(
+        string dbPath, SolutionLoadResult loadResult, IReadOnlySet<string> dirtyProjects, IReadOnlySet<string> removedProjects)
+    {
+        var result = new IndexResult();
+        var gitCommit = GetGitCommit(_repoRoot);
+        var indexedAt = DateTime.UtcNow;
+        var fullDbPath = Path.GetFullPath(dbPath);
+        var solutionName = Path.GetFileNameWithoutExtension(loadResult.SolutionPath);
+        var solutionRelPath = PathUtil.ToRepoRelative(_repoRoot, loadResult.SolutionPath);
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(loadResult.SolutionPath)) ?? _repoRoot;
+
+        using (var db = new IndexDatabase(fullDbPath, _repoRoot))
+        {
+            db.BeginTransaction();
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+
+            // Delete what is being replaced. Rows of other projects that point into it cannot exist: anything that
+            // references a dirty project is itself dirty.
+            foreach (var (id, path) in db.GetProjects())
+                if (dirtyProjects.Contains(path) || removedProjects.Contains(path))
+                    db.DeleteProject(id);
+            db.DeleteSolutionLevelDiagnostics();
+            foreach (var d in loadResult.Diagnostics)
+                db.InsertDiagnostic(d, null, null);
+            db.CollectGarbage();
+
+            foreach (var owner in dirtyProjects.Concat(removedProjects).Append(""))
+                db.DeleteInputsByOwner(owner);
+
+            var solutionId = db.GetFirstSolutionId() ?? db.InsertSolution(solutionName, solutionRelPath, indexedAt);
+            db.UpdateSolution(solutionId, solutionName, solutionRelPath, indexedAt);
+
+            var keyToId = db.LoadSymbolKeys();
+            var toIndex = loadResult.IndexableProjects
+                .Where(p => dirtyProjects.Contains(PathUtil.ToRepoRelative(_repoRoot, p.FilePath)))
+                .ToList();
+            await WriteProjectsAsync(db, toIndex, solutionId, solutionDir, keyToId, result);
+
+            // Inputs of the projects that were redone (indexed or not), plus the solution and build-wide files.
+            WriteInputs(db, loadResult, loadResult.Projects.Where(p => dirtyProjects.Contains(PathUtil.ToRepoRelative(_repoRoot, p.FilePath))));
+
+            var finish = System.Diagnostics.Stopwatch.StartNew();
+            db.CollectGarbage();
+            db.RebuildFtsIndex();
+            WriteMeta(db, loadResult, solutionRelPath, indexedAt, gitCommit);
+            db.CommitTransaction();
+            db.Checkpoint();
+            result.Timings["finish"] = finish.Elapsed;
         }
 
         UpdateCatalog(fullDbPath, solutionName, solutionRelPath, gitCommit, indexedAt);
@@ -81,8 +165,21 @@ public sealed class IndexEngine
         foreach (var d in loadResult.Diagnostics)
             db.InsertDiagnostic(d, null, null);
 
-        // Symbol identity: every row is reachable by its key, whichever project or syntax node it came from.
         var keyToId = new Dictionary<string, long>(StringComparer.Ordinal);
+        await WriteProjectsAsync(db, loadResult.IndexableProjects.ToList(), solutionId, solutionDir, keyToId, result);
+        WriteInputs(db, loadResult, loadResult.Projects);
+    }
+
+    /// <summary>
+    /// Writes the given projects: their files and declared symbols (pass 1), then the references and relationships of
+    /// every file (pass 2). <paramref name="keyToId"/> maps symbol keys to row ids; an incremental update passes it
+    /// pre-filled with the projects it keeps so references into them resolve.
+    /// </summary>
+    private async Task WriteProjectsAsync(
+        IndexDatabase db, IReadOnlyList<IndexedProject> projects, long solutionId, string solutionDir,
+        Dictionary<string, long> keyToId, IndexResult result)
+    {
+        // Symbol identity: every row is reachable by its key, whichever project or syntax node it came from.
         var keyCache = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
 
         string KeyOf(ISymbol symbol)
@@ -130,7 +227,7 @@ public sealed class IndexEngine
                 row.DocSummary, row.IsGenerated);
             keyToId[row.Key] = id;
             foreach (var loc in row.Locations)
-                db.InsertLocation(id, loc.FileId, loc.StartLine, loc.StartColumn, loc.EndLine, loc.EndColumn, loc.IsPrimary);
+                db.InsertLocation(id, loc.FileId, loc.StartLine, loc.StartColumn, loc.EndLine, loc.EndColumn, loc.IsPrimary && !isNamespace);
             if (!isNamespace) result.SymbolsIndexed++;
         }
 
@@ -139,7 +236,7 @@ public sealed class IndexEngine
 
         // Pass 1: projects, files, declared symbols.
         var phase = System.Diagnostics.Stopwatch.StartNew();
-        foreach (var project in loadResult.IndexableProjects)
+        foreach (var project in projects)
         {
             var roslynProject = project.RoslynProject!;
             var projectPath = roslynProject.FilePath ?? "";
@@ -284,9 +381,9 @@ public sealed class IndexEngine
                 db.InsertDiagnostic(diagnostic, db.GetProjectIdByPath(PathUtil.ToRepoRelative(_repoRoot, item.Project.FilePath)), null);
             }
         }
-    }
 
-    // (pass 2 timing is recorded by the caller, which also times the finish)
+        result.Timings["references"] = phase.Elapsed;
+    }
 
     /// <summary>Whether a used-but-not-indexed symbol is worth a stub row.</summary>
     private static bool CanStub(ISymbol symbol) => symbol switch

@@ -29,9 +29,13 @@ an index built by an older version: re-run `index`).
 | `truncated` | boolean | always | `true` if the result was cut by `limit` |
 | `warnings` | string[] | when any | Non-fatal notes. If stale, the first one says so. |
 
-Staleness is checked on every query: each indexed file's size and modification time are compared with the file on
-disk, and only a file whose stat differs is hashed. It detects modified and deleted files, not files added since
-indexing. Re-run `index` to refresh; it replaces the database.
+Staleness is checked on every query against the inputs recorded when the index was built: the source files of the indexed
+projects, their project files and restore output (`obj/project.assets.json`), a fingerprint of the `*.cs` files under
+each project directory (so a file that was **added, deleted, or renamed** is noticed), and the solution and build-wide
+files (`Directory.Build.props`, `global.json`, ...). A file whose size and modification time are unchanged costs one stat;
+only a file whose stat differs is hashed, and it counts as stale only if its content differs. Projects the filter excluded
+are not checked. `stale_files` lists paths; a directory whose file list changed appears as
+`path/ (files added, deleted, or renamed)`. Re-run `index` to refresh.
 
 ### Example
 
@@ -196,9 +200,21 @@ implementers) of a type. `data`: `{ supertypes, subtypes }`, each a tree of `{ s
 
 ## 6. Non-query commands
 
-`index <solution> [--db P] [--include pattern] [--exclude pattern]` builds a fresh database (the old one is
-replaced only when the new one is complete) and prints a summary. `info` prints statistics, staleness, and
-diagnostics. `list` and `resolve` read the catalog. These print plain text.
+`index <solution> [--db P] [--include pattern] [--exclude pattern] [--full] [--dry-run]` brings the index up to date and
+prints what it did (plain text):
+
+- **Up to date:** nothing the index depends on changed, so nothing is loaded or written (milliseconds).
+- **Incremental:** only the projects a change affects are redone, with the reason for each (`changed: ...`,
+  `redo: <project> (<why>)`, `keep: <project>`). A project is redone if one of its inputs changed, if it was added, or if a
+  project it references is redone.
+- **Full:** the whole index is rebuilt, with the reason (first index, `--full`, a build-wide file or the project filter or
+  the SDK or the tool version changed, an unreadable or older index, or every project affected).
+
+`--dry-run` prints the plan and changes nothing. An update is one transaction: a failure leaves the previous index intact.
+After an incremental update, symbol `id`s of the projects that were kept are unchanged; the ids of redone projects are new,
+and `key`s are always stable.
+
+`info` prints statistics, staleness, and diagnostics. `list` and `resolve` read the catalog.
 
 Database selection for queries: `--db <path>`, else `--solution <name>` via the catalog, else the only indexed
 solution if there is exactly one.

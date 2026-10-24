@@ -8,7 +8,7 @@ small, structured, trustworthy answers.
 The indexer is a **standalone, general-purpose code-intelligence tool**. It knows nothing about any
 consumer (workflow engines, mocking, personas). Consumers build on its queries.
 
-Status: **Revised plan (2026-10-24), after a code review. Phases A, B, C, D, and E are done.** Phases 0-3 of the first plan produced a working
+Status: **Revised plan (2026-10-24), after a code review. Phases A, B, C, D, E, and F are done.** Phases 0-3 of the first plan produced a working
 skeleton (42 tests pass) but the extraction and storage layers have correctness gaps that defeat the
 purpose (section 7). The revised phases fix those before adding features.
 
@@ -348,11 +348,66 @@ finish 0.1 s. The index command prints these.
 - Possible later speed-ups (not needed at this size): bind files in parallel in the reference pass (the writer and
   the external-stub resolver would need a lock), and a long-lived `serve` mode to avoid per-call process start-up.
 
-### Phase F: Incremental indexing and freshness
-- [ ] Hash comparison; reindex changed files and their dependents (document the dependency rule).
-- [ ] Deleted/renamed files and project-file changes (reindex affected projects).
-- [ ] Tests: edit/add/delete, then compare with a clean rebuild.
-- [ ] `--watch` optional and deferrable.
+### Phase F: Incremental indexing and freshness (done 2026-10-24)
+**Outcome:** re-running `index` redoes only what a change affects, does nothing when nothing changed, and always
+produces what a clean rebuild would. Schema version 6. Suite: 263 passing (about 2 minutes; the incremental scenario
+test is most of it).
+
+**The dependency rule.** The unit of work is the project. A project is redone when
+1. one of its inputs changed: a source file (including generated ones under `obj\`), additional file or analyzer
+   config, its project file, its restore output (`obj\project.assets.json`), or the set of `*.cs` files under its
+   directory (an addition, deletion, or rename; a fingerprint of the sorted relative paths, not of the contents);
+2. it was added to the solution; or
+3. any project it references, directly or transitively, is redone, because what it binds to may have changed.
+   Projects the filter excludes still count here: their inputs are tracked, and indexed projects that reference them
+   are redone when they change.
+
+Everything is rebuilt, rather than updated, when a build-wide file changed or appeared (`Directory.Build.props`,
+`.targets`, `.rsp`, `Directory.Packages.props`, `global.json`, `nuget.config`), the project filter changed, the .NET SDK
+changed, the tool version or schema differs, the index belongs to a different solution, the index file is unreadable, or
+every indexed project would be redone anyway. `--full` forces a rebuild; `--dry-run` shows the plan and writes nothing.
+
+- [x] **Inputs table:** at index time every input is recorded (path, kind, owner project, whether the owner is indexed,
+      content hash, size, modification time), for all loaded projects including excluded ones, plus the solution and
+      build-wide files. A file is re-read only when its size or modification time differs, and counts as changed only if
+      its content does (saving without editing is not a change).
+- [x] **Up to date without loading:** if no input changed, `index` reports it and exits without starting MSBuild:
+      244 ms for Storage.V1, against 22 s to rebuild.
+- [x] **Update in place, in one transaction:** the redone projects are deleted (foreign keys remove their files, symbols,
+      locations, references, and edges) and written again by the same two passes a full build uses, resolving references
+      into the kept projects through their existing symbol keys. Kept projects are untouched, symbol ids included (ids of
+      redone projects are new; keys are always stable). A failure rolls back and leaves the index as it was.
+      Orphans are collected afterwards: external stubs nothing points at, and namespaces nothing declares.
+- [x] **Deleted, renamed, and added files and projects:** handled through the listing fingerprint, the source inputs, and
+      the project list; a removed project's rows and inputs go. Project-file and restore changes redo the project.
+- [x] **Staleness uses the same inputs (F15):** every query now also notices files added, deleted or renamed and changes
+      to the solution and build-wide files, not only edits to indexed files; it ignores projects the filter excluded.
+- [x] **Tests:** one long scenario applies a sequence of 16 steps to a throwaway copy of the `Incremental` fixture (Base, Mid
+      uses Base, Leaf uses Mid, Solo uses nothing, Tests uses Base and is excluded) and, after each, compares the updated
+      index with a clean rebuild of the same files: body edits, an API change at the start of the chain, an unchanged
+      save, adding, deleting and renaming files, editing an excluded project and a project file, a dry run, adding and
+      removing a project, a build-wide file appearing and disappearing, a filter change, a tool-version mismatch, and
+      `--full`. It also asserts which projects were redone and kept, and that kept projects keep their symbol ids.
+      Separate tests cover atomicity (an update sabotaged mid-way leaves the index identical, and the retry works), an
+      old-schema and a corrupt index file, the planning rule, the input scanner, garbage collection, and a negative control
+      showing the comparison fails for each kind of damage it covers.
+- [x] **Verified on the Google fork** (read-only; the fork stayed clean), by making recorded inputs look changed in a copy
+      of the Storage.V1 index and comparing each result with a full rebuild by an independent Python script (identical
+      symbols, locations, references, edges, files, projects, diagnostics, inputs):
+
+      | Change | Projects redone | Kept | Time |
+      |---|---|---|---|
+      | nothing | none (nothing loaded) | all | 0.24 s |
+      | a ThroughputTool file | ThroughputTool | 4 | 9.6 s |
+      | `StorageClient.cs` | Storage.V1, RetryConformanceTests, ThroughputTool | ClientTesting, PubSub.V1 | 14.1 s |
+      | a file added/removed in PubSub.V1 | PubSub.V1, RetryConformanceTests | 3 | 20.3 s |
+      | full rebuild | all | none | 21.9 s |
+
+- Limits: any run that has to update still loads the whole solution with MSBuild (about 7.5 s here), which is why a leaf
+  edit is 9.6 s rather than 2 s; a `Compile Include` that pulls in files from outside the project directory is tracked per
+  file but a new such file is only noticed when the project file changes; installing a newer SDK when no `global.json`
+  pins one is noticed only on the next run that loads the solution; `--watch` is not implemented (deferred, as the plan
+  allowed): run `index` before a query, or rely on the `stale` flag.
 
 ### Phase G: Packaging and agent ergonomics
 - [ ] `dotnet tool` packaging, published ReadyToRun (a query goes from about 265 ms to about 215 ms; the .NET host

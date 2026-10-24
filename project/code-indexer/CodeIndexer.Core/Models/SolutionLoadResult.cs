@@ -9,6 +9,19 @@ public sealed class SolutionLoadResult
     public IReadOnlyList<IndexedProject> Projects { get; init; } = Array.Empty<IndexedProject>();
     public IReadOnlyList<DiagnosticEntry> Diagnostics { get; init; } = Array.Empty<DiagnosticEntry>();
 
+    /// <summary>Identifies the project filter that was applied (see ProjectFilter.Signature).</summary>
+    public string FilterSignature { get; init; } = "";
+
+    /// <summary>Version of the .NET SDK whose MSBuild loaded the solution.</summary>
+    public string SdkVersion { get; init; } = "";
+
+    /// <summary>
+    /// For each project file (full path), the project files that depend on it, directly or transitively. Covers every
+    /// project in the solution, including ones the filter excludes, because an indexed project binds against them.
+    /// </summary>
+    public IReadOnlyDictionary<string, IReadOnlySet<string>> Dependents { get; init; } =
+        new Dictionary<string, IReadOnlySet<string>>();
+
     /// <summary>
     /// How many projects were successfully loaded.
     /// </summary>

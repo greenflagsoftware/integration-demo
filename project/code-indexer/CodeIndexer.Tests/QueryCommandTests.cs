@@ -828,7 +828,7 @@ public class StalenessTests : QueryCommandTestBase
         var db = CopyDatabase();
         try
         {
-            Execute(db, "UPDATE files SET content_hash = 'deadbeef', size_bytes = size_bytes + 1 WHERE path LIKE '%/Calculator.cs'");
+            Execute(db, "UPDATE inputs SET hash = 'deadbeef', size_bytes = size_bytes + 1 WHERE kind = 'source' AND path LIKE '%/Calculator.cs'");
             using var q = new SymbolQueries(db);
 
             var r = q.FindSymbol("Calculator");
@@ -848,7 +848,52 @@ public class StalenessTests : QueryCommandTestBase
         try
         {
             // A different modification time with the same content must be confirmed by hash and found fresh.
-            Execute(db, "UPDATE files SET modified_ticks = 1");
+            Execute(db, "UPDATE inputs SET modified_ticks = 1 WHERE kind <> 'listing'");
+            using var q = new SymbolQueries(db);
+
+            Assert.False(q.FindSymbol("Calculator").Stale);
+        }
+        finally { Fixtures.DeleteDb(db); }
+    }
+
+    [Fact]
+    public void FilesAddedOrRenamed_AreNoticed_ThroughTheDirectoryListing()
+    {
+        var db = CopyDatabase();
+        try
+        {
+            Execute(db, "UPDATE inputs SET hash = 'not-the-listing' WHERE kind = 'listing' AND path LIKE '%/Semantics.Core'");
+            using var q = new SymbolQueries(db);
+
+            var r = q.FindSymbol("Calculator");
+
+            Assert.True(r.Stale);
+            Assert.Contains(r.StaleFiles!, f => f.EndsWith("Semantics.Core/ (files added, deleted, or renamed)"));
+        }
+        finally { Fixtures.DeleteDb(db); }
+    }
+
+    [Fact]
+    public void ChangedBuildWideFile_MarksTheIndexStale()
+    {
+        var db = CopyDatabase();
+        try
+        {
+            Execute(db, "INSERT OR REPLACE INTO inputs (path, kind, owner, indexed, hash, size_bytes, modified_ticks) VALUES ('project/code-indexer/Directory.Build.props', 'env', '', 1, 'old', 1, 1)");
+            using var q = new SymbolQueries(db);
+
+            Assert.Contains("project/code-indexer/Directory.Build.props", q.FindSymbol("Calculator").StaleFiles!);
+        }
+        finally { Fixtures.DeleteDb(db); }
+    }
+
+    [Fact]
+    public void ChangesInAProjectTheFilterExcluded_DoNotMakeTheIndexStale()
+    {
+        var db = CopyDatabase();
+        try
+        {
+            Execute(db, "INSERT INTO inputs (path, kind, owner, indexed, hash, size_bytes, modified_ticks) VALUES ('project/code-indexer/tests/Fixtures/Semantics/Semantics.Core/Calculator.cs', 'source', 'some/Excluded.Tests.csproj', 0, 'old', 1, 1)");
             using var q = new SymbolQueries(db);
 
             Assert.False(q.FindSymbol("Calculator").Stale);
@@ -862,7 +907,7 @@ public class StalenessTests : QueryCommandTestBase
         var db = CopyDatabase();
         try
         {
-            Execute(db, "UPDATE files SET path = 'gone/Misc.cs' WHERE path LIKE '%/Misc.cs'");
+            Execute(db, "UPDATE inputs SET path = 'gone/Misc.cs' WHERE kind = 'source' AND path LIKE '%/Misc.cs'");
             using var q = new SymbolQueries(db);
 
             var r = q.FindSymbol("Calculator");

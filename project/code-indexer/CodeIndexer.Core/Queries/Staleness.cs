@@ -1,4 +1,4 @@
-using CodeIndexer.Core.Storage;
+using CodeIndexer.Core.Indexing;
 using Microsoft.Data.Sqlite;
 
 namespace CodeIndexer.Core.Queries;
@@ -10,9 +10,11 @@ public sealed record StalenessResult(bool IsStale, IReadOnlyList<string> Changed
 }
 
 /// <summary>
-/// Compares every indexed file with the file on disk. Size and modification time are checked first, so an untouched
-/// file costs one stat; only a file whose stat differs is hashed, and it counts as changed only if the hash differs.
-/// Detects modified and deleted files; it cannot know about files added since indexing.
+/// Compares what the index was built from with the disk. The recorded inputs are the source files of the indexed projects,
+/// their project files and restore output, a fingerprint of each project directory's *.cs listing (so added, deleted, and
+/// renamed files are noticed), and the solution and build-wide files. A file whose size and modification time are
+/// unchanged costs one stat; only one whose stat differs is hashed, and it counts as changed only if its content differs.
+/// Projects the filter excluded are not checked, because nothing indexed came from them.
 /// </summary>
 public static class Staleness
 {
@@ -21,33 +23,26 @@ public static class Staleness
         if (string.IsNullOrEmpty(repoRoot) || !Directory.Exists(repoRoot))
             return StalenessResult.Fresh;
 
+        var stored = new List<InputRecord>();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "SELECT path, kind, owner, indexed, hash, size_bytes, modified_ticks FROM inputs";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                stored.Add(new InputRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3) != 0, r.GetString(4), r.GetInt64(5), r.GetInt64(6)));
+        }
+
         var changed = new List<string>();
         var missing = new List<string>();
-
-        using var cmd = connection.CreateCommand();
-        cmd.CommandText = "SELECT path, content_hash, size_bytes, modified_ticks FROM files";
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
+        foreach (var change in InputScanner.FindChanges(stored, repoRoot, indexedOnly: true))
         {
-            var relative = reader.GetString(0);
-            var storedHash = reader.GetString(1);
-            long? size = reader.IsDBNull(2) ? null : reader.GetInt64(2);
-            long? ticks = reader.IsDBNull(3) ? null : reader.GetInt64(3);
-
-            // Source-generator output has no file on disk and was indexed without a stat; nothing to compare.
-            if (size is null) continue;
-
-            var info = new FileInfo(Path.Combine(repoRoot, relative));
-            if (!info.Exists)
-            {
-                missing.Add(relative);
-                continue;
-            }
-            if (info.Length == size && info.LastWriteTimeUtc.Ticks == ticks)
-                continue;
-
-            if (IndexDatabase.ComputeContentHash(File.ReadAllBytes(info.FullName)) != storedHash)
-                changed.Add(relative);
+            var path = change.Stored.Path;
+            if (change.Reason is "deleted" or "directory deleted")
+                missing.Add(path);
+            else if (change.Stored.Kind == InputScanner.Listing)
+                changed.Add($"{path}/ ({change.Reason})");
+            else
+                changed.Add(path);
         }
 
         return changed.Count == 0 && missing.Count == 0

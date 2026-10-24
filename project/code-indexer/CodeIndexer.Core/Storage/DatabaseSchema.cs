@@ -2,7 +2,7 @@ using Microsoft.Data.Sqlite;
 namespace CodeIndexer.Core.Storage;
 public static class DatabaseSchema
 {
-    public const int SchemaVersion = 5;
+    public const int SchemaVersion = 6;
     private static readonly string[] CreateStatements =
     {
         "CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL );",
@@ -15,6 +15,8 @@ public static class DatabaseSchema
         "CREATE TABLE IF NOT EXISTS diagnostics ( id INTEGER PRIMARY KEY AUTOINCREMENT, severity TEXT NOT NULL, message TEXT NOT NULL, project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL, file_id INTEGER REFERENCES files(id) ON DELETE SET NULL );",
         "CREATE TABLE IF NOT EXISTS symbol_references ( id INTEGER PRIMARY KEY AUTOINCREMENT, symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, line INTEGER NOT NULL, column INTEGER NOT NULL, length INTEGER NOT NULL DEFAULT 1, kind TEXT NOT NULL DEFAULT 'use', reference_name TEXT, enclosing_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL );",
         "CREATE TABLE IF NOT EXISTS edges ( from_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE, to_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE, kind TEXT NOT NULL, PRIMARY KEY (from_symbol_id, to_symbol_id, kind) ) WITHOUT ROWID;",
+        "CREATE TABLE IF NOT EXISTS inputs ( path TEXT NOT NULL, kind TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', indexed INTEGER NOT NULL DEFAULT 1, hash TEXT NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0, modified_ticks INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (path, kind, owner) );",
+        "CREATE INDEX IF NOT EXISTS idx_inputs_owner ON inputs(owner);",
         "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(name, full_name, signature, doc_summary, content='symbols', content_rowid='id', tokenize='porter unicode61');",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_key ON symbols(key);",
         "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);",

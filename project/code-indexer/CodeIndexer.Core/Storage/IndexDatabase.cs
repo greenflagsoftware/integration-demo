@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using CodeIndexer.Core.Indexing;
 using CodeIndexer.Core.Models;
 using Microsoft.Data.Sqlite;
 
@@ -22,11 +23,20 @@ public sealed class IndexDatabase : IDisposable
         _repoRoot = repoRoot;
         var builder = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate, Cache = SqliteCacheMode.Shared, Pooling = false };
         _connection = new SqliteConnection(builder.ConnectionString);
-        _connection.Open();
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;";
-        cmd.ExecuteNonQuery();
-        DatabaseSchema.EnsureSchema(_connection);
+        try
+        {
+            _connection.Open();
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;";
+            cmd.ExecuteNonQuery();
+            DatabaseSchema.EnsureSchema(_connection);
+        }
+        catch
+        {
+            // A constructor that throws is never disposed; close the file so the caller can replace it.
+            _connection.Dispose();
+            throw;
+        }
     }
 
     public void BeginTransaction() => _transaction = _connection.BeginTransaction();
@@ -216,6 +226,128 @@ public sealed class IndexDatabase : IDisposable
         cmd.Parameters.AddWithValue("@pid", projectId);
         cmd.Parameters.AddWithValue("@p", relativePath);
         return cmd.ExecuteScalar() as long?;
+    }
+
+    // ---- inputs: everything the index depends on, for incremental updates and staleness ----------
+
+    public void InsertInput(InputRecord input)
+    {
+        var cmd = Prepared(
+            "INSERT OR REPLACE INTO inputs (path, kind, owner, indexed, hash, size_bytes, modified_ticks) VALUES (@p, @k, @o, @i, @h, @s, @m)",
+            "@p", "@k", "@o", "@i", "@h", "@s", "@m");
+        cmd.Parameters["@p"].Value = input.Path;
+        cmd.Parameters["@k"].Value = input.Kind;
+        cmd.Parameters["@o"].Value = input.Owner;
+        cmd.Parameters["@i"].Value = input.Indexed ? 1 : 0;
+        cmd.Parameters["@h"].Value = input.Hash;
+        cmd.Parameters["@s"].Value = input.Size;
+        cmd.Parameters["@m"].Value = input.ModifiedTicks;
+        cmd.ExecuteNonQuery();
+    }
+
+    public List<InputRecord> GetInputs()
+    {
+        var list = new List<InputRecord>();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT path, kind, owner, indexed, hash, size_bytes, modified_ticks FROM inputs ORDER BY path, kind, owner";
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(new InputRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3) != 0, r.GetString(4), r.GetInt64(5), r.GetInt64(6)));
+        return list;
+    }
+
+    /// <summary>Removes the inputs owned by a project (owner = its repo-relative path), or the build-wide ones (owner = "").</summary>
+    public void DeleteInputsByOwner(string owner)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM inputs WHERE owner = @o";
+        cmd.Parameters.AddWithValue("@o", owner);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ---- incremental update helpers ---------------------------------------------------------------
+
+    public List<(long Id, string Path)> GetProjects()
+    {
+        var list = new List<(long, string)>();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT id, path FROM projects";
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) list.Add((r.GetInt64(0), r.GetString(1)));
+        return list;
+    }
+
+    /// <summary>
+    /// Deletes a project and, through the foreign keys, its files, symbols, locations, references and edges, together with
+    /// the references and edges other rows hold to those symbols. Diagnostics are deleted explicitly because their
+    /// project link is "set null", which would leave them looking solution-wide.
+    /// </summary>
+    public void DeleteProject(long projectId)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM diagnostics WHERE project_id = @p; DELETE FROM projects WHERE id = @p;";
+        cmd.Parameters.AddWithValue("@p", projectId);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void DeleteSolutionLevelDiagnostics()
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM diagnostics WHERE project_id IS NULL";
+        cmd.ExecuteNonQuery();
+    }
+
+    public long? GetFirstSolutionId()
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT id FROM solutions ORDER BY id LIMIT 1";
+        return cmd.ExecuteScalar() as long?;
+    }
+
+    public void UpdateSolution(long solutionId, string name, string path, DateTime indexedAt)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "UPDATE solutions SET name = @n, path = @p, indexed_at = @a WHERE id = @i";
+        cmd.Parameters.AddWithValue("@n", name);
+        cmd.Parameters.AddWithValue("@p", path);
+        cmd.Parameters.AddWithValue("@a", indexedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("@i", solutionId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Key to row id for every symbol, so an update can resolve references into projects it did not touch.</summary>
+    public Dictionary<string, long> LoadSymbolKeys()
+    {
+        var map = new Dictionary<string, long>(StringComparer.Ordinal);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT key, id FROM symbols";
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) map[r.GetString(0)] = r.GetInt64(1);
+        return map;
+    }
+
+    /// <summary>
+    /// Removes rows that exist only because of something that was deleted: namespaces nothing declares any more, and
+    /// external stubs that no reference, edge or other stub points at. A clean index never contains them, so this keeps an
+    /// updated index identical to a rebuilt one. Returns the number of rows removed.
+    /// </summary>
+    public int CollectGarbage()
+    {
+        int total = 0;
+        using var cmd = _connection.CreateCommand();
+
+        cmd.CommandText = @"DELETE FROM symbols WHERE kind = 'namespace' AND is_external = 0
+                            AND NOT EXISTS (SELECT 1 FROM symbol_locations l WHERE l.symbol_id = symbols.id)";
+        total += cmd.ExecuteNonQuery();
+
+        // Removing a stub can free the stub that contained it, so repeat until nothing more goes.
+        cmd.CommandText = @"DELETE FROM symbols WHERE is_external = 1
+                            AND NOT EXISTS (SELECT 1 FROM symbol_references r WHERE r.symbol_id = symbols.id)
+                            AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.from_symbol_id = symbols.id OR e.to_symbol_id = symbols.id)
+                            AND NOT EXISTS (SELECT 1 FROM symbols c WHERE c.container_id = symbols.id)";
+        int removed;
+        while ((removed = cmd.ExecuteNonQuery()) > 0) total += removed;
+        return total;
     }
 
     public void SetMeta(string key, string value) => DatabaseSchema.SetMeta(_connection, key, value);

@@ -85,24 +85,26 @@ Command Query(string name, string description, Argument? arg, Action<Command>? c
 
 // ---- index ---------------------------------------------------------------------------------------
 
-var indexCommand = new Command("index", "Index a .NET solution into a fresh SQLite database (replaces any previous index)");
+var indexCommand = new Command("index",
+    "Index a .NET solution into a SQLite database. Updates an existing index incrementally (only projects affected by a " +
+    "change are redone) and does nothing if nothing changed; use --full to rebuild from scratch");
 var solutionArg = new Argument<FileInfo>("solution", "Path to the .sln, .slnx, or .csproj file");
 var includeOption = new Option<string[]>("--include", () => Array.Empty<string>(), "Project names to include (exact, or with * and ? wildcards)");
 var excludeOption = new Option<string[]>("--exclude", () => Array.Empty<string>(), "Project names to exclude (exact, or with * and ? wildcards)");
+var fullOption = new Option<bool>("--full", () => false, "Rebuild the whole index instead of updating it");
+var dryRunOption = new Option<bool>("--dry-run", () => false, "Show what would be redone and why, without changing the index");
 indexCommand.AddArgument(solutionArg);
 indexCommand.AddOption(dbOption);
 indexCommand.AddOption(includeOption);
 indexCommand.AddOption(excludeOption);
+indexCommand.AddOption(fullOption);
+indexCommand.AddOption(dryRunOption);
 
-indexCommand.SetHandler(async (FileInfo solution, string db, string[] include, string[] exclude) =>
+indexCommand.SetHandler(async (FileInfo solution, string db, string[] include, string[] exclude, bool full, bool dryRun) =>
 {
     var filter = new ProjectFilter();
     foreach (var inc in include) filter.Include(inc);
     foreach (var exc in exclude) filter.Exclude(exc);
-    var timer = System.Diagnostics.Stopwatch.StartNew();
-    var loadResult = await new SolutionLoader(filter).LoadAsync(solution.FullName);
-    var loadTime = timer.Elapsed;
-    SolutionLoader.PrintSummary(loadResult);
 
     var dbPath = db;
     if (string.IsNullOrEmpty(dbPath))
@@ -112,16 +114,42 @@ indexCommand.SetHandler(async (FileInfo solution, string db, string[] include, s
         Directory.CreateDirectory(codeIndexDir);
         dbPath = Path.Combine(codeIndexDir, $"{Path.GetFileNameWithoutExtension(solution.FullName)}.db");
     }
-    Console.WriteLine($"\nIndexing to: {dbPath}");
-    var engine = new IndexEngine(FindRepoRoot(solution.FullName));
-    var result = await engine.IndexSolutionAsync(dbPath, loadResult);
+
+    var timer = System.Diagnostics.Stopwatch.StartNew();
+    var run = await IndexRunner.RunAsync(new IndexRunOptions(solution.FullName, dbPath, FindRepoRoot(solution.FullName), filter, full, dryRun));
+
+    if (run.LoadResult is not null)
+        SolutionLoader.PrintSummary(run.LoadResult);
+
+    var verb = run.WasDryRun ? "Would " : "";
+    switch (run.Mode)
+    {
+        case IndexMode.UpToDate:
+            Console.WriteLine($"Index is up to date ({run.Reason}). Nothing was loaded or written.");
+            return;
+        case IndexMode.Full:
+            Console.WriteLine($"\n{verb}rebuild the whole index ({run.Reason}).".TrimStart());
+            break;
+        case IndexMode.Incremental:
+            Console.WriteLine($"\n{verb}update incrementally ({run.Reason}).".TrimStart());
+            foreach (var c in run.ChangedInputs.Take(8)) Console.WriteLine($"  changed: {c}");
+            if (run.ChangedInputs.Count > 8) Console.WriteLine($"  ... and {run.ChangedInputs.Count - 8} more");
+            foreach (var r in run.Reindexed) Console.WriteLine($"  redo:    {r.Name} ({r.Reason})");
+            foreach (var u in run.Unchanged) Console.WriteLine($"  keep:    {u}");
+            foreach (var x in run.Removed) Console.WriteLine($"  removed: {x}");
+            break;
+    }
+    if (run.WasDryRun) { Console.WriteLine("Dry run: the index was not changed."); return; }
+
+    var result = run.Result!;
+    Console.WriteLine($"Index: {dbPath}");
     Console.WriteLine($"Indexed: {result.ProjectsIndexed} projects, {result.FilesIndexed} files, {result.SymbolsIndexed} symbols " +
                       $"(+{result.ExternalSymbolsIndexed} external), {result.ReferencesExtracted} references, {result.EdgesExtracted} edges");
-    Console.WriteLine("Time: load " + loadTime.TotalSeconds.ToString("F1") + "s, " +
+    Console.WriteLine("Time: " + timer.Elapsed.TotalSeconds.ToString("F1") + "s total; " +
                       string.Join(", ", result.Timings.Select(t => $"{t.Key} {t.Value.TotalSeconds:F1}s")));
     foreach (var d in result.Diagnostics)
         Console.WriteLine($"  [diag] {d}");
-}, solutionArg, dbOption, includeOption, excludeOption);
+}, solutionArg, dbOption, includeOption, excludeOption, fullOption, dryRunOption);
 rootCommand.AddCommand(indexCommand);
 
 // ---- info / list / resolve -----------------------------------------------------------------------

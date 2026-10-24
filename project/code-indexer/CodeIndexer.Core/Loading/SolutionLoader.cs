@@ -19,6 +19,9 @@ public sealed class SolutionLoader
     /// <summary>Which SDK's MSBuild was registered and why, once <see cref="RegisterMsBuild"/> has run.</summary>
     public static string? RegisteredSdkDescription { get; private set; }
 
+    /// <summary>The registered SDK's version, for example "8.0.426".</summary>
+    public static string? RegisteredSdkVersion { get; private set; }
+
     /// <summary>
     /// Registers an MSBuild instance. If a global.json governs <paramref name="solutionDirectory"/>, the SDK it
     /// pins (subject to its rollForward policy) is used; otherwise the highest installed SDK. Has no effect
@@ -48,6 +51,7 @@ public sealed class SolutionLoader
             }
 
             MSBuildLocator.RegisterInstance(instances.First(i => i.Version == chosenVersion));
+            RegisteredSdkVersion = chosenVersion.ToString();
             RegisteredSdkDescription = pinned is null
                 ? $"{chosenVersion} (highest installed; no global.json found)"
                 : $"{chosenVersion} (global.json pins {pinned.Value.Pin.Version}, rollForward {pinned.Value.Pin.RollForward}: {pinned.Value.Path})";
@@ -172,7 +176,35 @@ public sealed class SolutionLoader
             SolutionPath = solutionPath,
             Projects = projects,
             Diagnostics = diagnostics,
+            FilterSignature = _filter.Signature,
+            SdkVersion = RegisteredSdkVersion ?? "",
+            Dependents = ComputeDependents(roslynSolution),
         };
+    }
+
+    /// <summary>
+    /// Maps each project file to the project files that depend on it transitively. Multi-targeted projects appear once per
+    /// target framework in Roslyn's graph; they are merged by file path.
+    /// </summary>
+    private static Dictionary<string, IReadOnlySet<string>> ComputeDependents(Solution solution)
+    {
+        var graph = solution.GetProjectDependencyGraph();
+        var pathOf = solution.Projects.ToDictionary(p => p.Id, p => p.FilePath ?? p.Name);
+        var result = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var project in solution.Projects)
+        {
+            var path = pathOf[project.Id];
+            if (!result.TryGetValue(path, out var set))
+                result[path] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var dependentId in graph.GetProjectsThatTransitivelyDependOnThisProject(project.Id))
+            {
+                var dependentPath = pathOf[dependentId];
+                if (!string.Equals(dependentPath, path, StringComparison.OrdinalIgnoreCase))
+                    set.Add(dependentPath);
+            }
+        }
+        return result.ToDictionary(kv => kv.Key, kv => (IReadOnlySet<string>)kv.Value, StringComparer.OrdinalIgnoreCase);
     }
 
     private static readonly Regex TfmSuffix = new(@"\s*\(([^()]+)\)\s*$", RegexOptions.Compiled);
