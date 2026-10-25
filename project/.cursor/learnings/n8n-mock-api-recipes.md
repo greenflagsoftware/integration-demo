@@ -46,6 +46,37 @@ Use the SDK's endpoint seam (a builder `Endpoint`/`BaseUri`/`BaseAddress`, an em
 - **Latency:** a Wait node (`resume: timeInterval`, `amount`, `unit: seconds`) before the Respond node (tested: 2 s). Use it to exercise client timeouts.
 - **Binary bodies, streaming, and chunked/resumable uploads:** the Webhook can receive binary (`options.binaryPropertyName`, POST/PUT/PATCH) and Respond can send a binary file; not tested here. Say so if an SDK operation depends on them, and look up current behaviour with Context7 first.
 
+### Google-style request routing (tested 2026-10-25)
+
+Google APIs use the `x-goog-request-params` header instead of path parameters for resource-parent routing. Parse it in a Code node:
+
+```javascript
+const headerVal = req.headers?.['x-goog-request-params'] ?? '';
+const parentMatch = headerVal.match(/parent=(.+)/);
+const parent = parentMatch ? decodeURIComponent(parentMatch[1]) : '';
+```
+
+**Note:** The header value may be URL-encoded (`projects%2Fmy-project%2Flocations%2Fus-central1`). Always call `decodeURIComponent()` on the match.
+
+### Google LRO (Long-Running Operation) response pattern (tested 2026-10-25)
+
+Some Google create APIs wrap the response in an LRO envelope. The pattern:
+
+```json
+{
+  "name": "operations/op-<uid>",
+  "done": true,
+  "response": {
+    "@type": "type.googleapis.com/google.iam.v3.ResourceName",
+    "name": "...",
+    "uid": "...",
+    ...
+  }
+}
+```
+
+Build it in a Code node after the data table insert. Use the auto-generated `row.createdAt` for timestamps, not a custom `createTime` field (the table doesn't have it):
+
 ## 4. Auth and token endpoints
 
 Fake auth is fine and expected in mocks. A token endpoint is just another mock: `POST /webhook/oauth2/token` → Respond with `{"access_token":"fake-token","token_type":"Bearer","expires_in":3600}`. To make protected endpoints check it, read `headers.authorization` in the Code node and return 401 when it isn't `Bearer fake-token` (tested: header present/absent paths). The Webhook node also has built-in header/basic/JWT auth (`authentication` parameter) which needs a credential created in n8n; the Code-node check needs none.

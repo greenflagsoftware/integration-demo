@@ -74,7 +74,18 @@ List: Webhook (`GET`, `responseMode: lastNode`, `responseData: allEntries`) → 
 
 ## Gotchas
 
-- `autoMapInputData` maps fields to columns by name, so the item's field names must match the table's column names. Shape the item in a Code node first (as the create example does) rather than passing the raw webhook item. (What happens with extra, unmatched fields was not tested.)
+- `autoMapInputData` maps fields to columns by name, so the item's field names must match the table's column names. Shape the item in a Code node first (as the create example does) rather than passing the raw webhook item. **Extra, unmatched fields cause the insert to fail** with `"unknown column name '<field>'"` (tested 2026-10-25). Strip out any fields that are not table columns before passing to a Data table `insert` node.
+- **Each inserted row gets auto-generated `id`, `createdAt`, `updatedAt` columns** (tested). These are not in your schema — the Data table adds them. When you need a timestamp in your mock API response, read from `row.createdAt` or `row.updatedAt` in a subsequent Code node. **Do not store `createTime`, `updateTime`, or similar names in the Code node that feeds the insert** unless they are explicit columns in your table schema.
+- Example of the pattern (Code node before insert outputs only matching fields; response Code node uses `row.createdAt`):
+```javascript
+// Pre-insert Code node — ONLY table column fields
+return [{ json: { name, uid, etag, displayName, parent, accessPolicyId } }];
+
+// Response formatting Code node (after insert) — uses auto-generated createdAt
+const ts = row.createdAt || new Date().toISOString();
+return [{ json: { name: row.name, createTime: ts, updateTime: ts, /* ... */ } }];
+```
+- **`createIfNotExists: true` will NOT add new columns to an existing table** (tested 2026-10-25). If the table already exists with fewer columns, the seed workflow's `Create table` node does nothing. To update the schema: delete the table first (n8n editor > Data tables tab) then re-run the seed, or use a different table name.
 - A data table is shared by every workflow that names it: two mocks writing `demo_items` see each other's rows. Use one table per SDK or per resource, prefixed (`gcs_objects`).
 - Looking a table up by name relies on the name being unique within the project (docs only: table names must be unique per project).
 - Changing a table's columns was not tested. The simple route is a new table name (or, in the sandbox, ask the user before deleting and re-creating one: deleting is not covered by the overwrite permission).

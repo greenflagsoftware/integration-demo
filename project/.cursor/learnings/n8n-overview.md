@@ -23,12 +23,14 @@ Then the SDK under test is pointed at `http://localhost:5678/webhook/...` and Fr
 | What | The user's own local Docker n8n. This is the **sandbox**. |
 | Address | `http://localhost:5678` (editor and webhooks). Health: `http://localhost:5678/healthz` returns `{"status":"ok"}`. |
 | Container | `n8n` (Linux). Data lives in the `n8n_data` volume, so it survives `docker restart n8n` and `docker compose stop`. |
-| Defined in | `E:\Dev\demos\integration-demo\docker\docker-compose.yml` (+ `.env`, git-ignored). |
+| Defined in | `E:\Dev\demos\integration-demo\docker\docker-compose.yml` (+ `E:\Dev\demos\integration-demo\docker\.env`, git-ignored). This is a **community edition** stack with Caddy on 80/443, SearXNG for AI search, and sandbox runners for AI code execution. |
 | Start / stop | From that folder: `docker compose up -d n8n` and `docker compose stop`. Starting `n8n` also starts the sandbox services it depends on. `caddy` (a public-facing proxy), `searxng`, and `sandbox-runner-1` are separate and are not started with it. |
+| Caddy proxy | Defined in `E:\Dev\demos\integration-demo\docker\Caddyfile`. Caddy listens on 80/443 and proxies only public paths (`/webhook/*`, `/webhook-waiting/*`, `/rest/oauth2-credential/callback`) to `n8n:5678`. Everything else gets 404. `$PUBLIC_DOMAIN` comes from the `.env` file (defaults to `localhost`). |
+| `.env` vars | `GENERIC_TIMEZONE=UTC`, `N8N_SANDBOX_VERSION=1.8.1`, plus AI sandbox secrets and SearXNG config. |
 | Version | 2.44.6 when this was written. Check: `docker exec n8n n8n --version`. n8n 2.x talks about **publishing** a workflow (older docs say "activating"). |
 | Task runner | Code nodes run JavaScript. The image has **no Python**, so write Code nodes in JavaScript. |
 
-At the time of writing it had no workflows and the owner account was not set up. If the user has since set it up, ask them for an API key only if you need the public API (see `n8n-pushing-and-operating.md`).
+The owner account **has been set up** and an n8n API key is available in `E:\Dev\demos\integration-demo\docker\.env` as `N8N_LLM_API_KEY` (tested 2026-10-25). Always prefer the **Public REST API** over the container CLI — it takes effect immediately and avoids all CLI pitfalls (see `n8n-pushing-and-operating.md`). Do not echo the key into chat.
 
 ## Sandbox vs stable/production (the rules)
 

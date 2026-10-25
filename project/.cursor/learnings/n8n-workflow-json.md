@@ -119,5 +119,8 @@ For documentation and examples use Context7 (`context7-lookup.md`). Docs describ
 - Returning an object instead of an array of `{ json }` from a Code node.
 - Using `responseMode: lastNode` and expecting a custom status code from a Respond node.
 - Expecting the test URL to work from an SDK (it doesn't; use the production URL of a published workflow).
+- **Code node feeding a Data table `insert` includes fields that aren't table columns** — causes `"unknown column name 'x'"` error. `autoMapInputData` maps **every field by name**. Strip non-column fields before the insert, or add them to the table schema.
+- **`createIfNotExists: true` does NOT add columns to an existing table** — the schema is unchanged. Delete the table first (n8n editor > Data tables tab) or use a new table name.
+- **Importing without an `id` creates a new workflow every time** — each import creates a new id, even if the name matches an existing one. To overwrite: add the `id` to the file, or deactivate/delete the old workflow first.
 
 Never put real secrets in this file.

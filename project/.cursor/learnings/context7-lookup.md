@@ -43,6 +43,14 @@ For other libraries use `library <official name with proper punctuation> "<what 
 - Never put secrets or proprietary code in a query: queries are sent to the Context7 service.
 - Queries that worked well while building the n8n learnings: Webhook response modes and test vs production URLs; Respond to Webhook options; data tables (create, columns, row operations, upsert); public API authentication and workflow endpoints; the n8n CLI import/export commands.
 
+### Specific queries that returned good results for the n8n API (tested 2026-10-25)
+
+- `resolve-library-id` with `libraryName: "n8n"` → `/n8n-io/n8n-docs` (High reputation, 10877 snippets)
+- `query-docs` with `libraryId: "/n8n-io/n8n-docs"` and:
+  - `"REST API activate deactivate workflow endpoint"` → returned `POST /workflows/{id}/activate` and `/workflows/{id}/deactivate`
+  - `"workflow public API create update delete"` → returned full scope table (`workflow:create`, `workflow:activate`, etc.)
+- These are reliable enough to code against without guessing
+
 ## Confirm against what you are running
 
 Docs are written for a release. Before you depend on a detail:
