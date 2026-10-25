@@ -53,6 +53,7 @@ A workflow you import or save is a **draft**. Only a **published** workflow answ
 - Fake datastore, seed data, table operations: `n8n-data-tables.md`
 - Making an SDK-shaped API (paths, params, auth, errors, pagination, latency): `n8n-mock-api-recipes.md`
 - Getting workflows into the instance, restarting, verifying, CLI pitfalls: `n8n-pushing-and-operating.md`
+- Serving a mock at the SDK's real host name (Caddy proxy, hosts entries, trusting its CA): `caddy-proxy.md`
 - Looking up anything else in n8n's documentation: `context7-lookup.md`
 
 Most of what these learnings say was **tested on n8n 2.44.6** on 2026-10-25 and is marked as such; anything taken only from documentation is marked "docs only".

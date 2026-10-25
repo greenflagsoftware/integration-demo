@@ -93,6 +93,20 @@ Frank works through command-line tools. This list will grow; when the user adds 
     is not live until it is published **and** n8n is restarted; a mock isn't done until you have called it
     with the SDK's real request and seen the success and error responses; tell the user before restarting
     n8n; fake tokens and client IDs in mocks are fine, real secrets never.
+- **Caddy proxy (Docker, `docker\Caddyfile`)**
+  - Caddy exists to make the n8n webhooks look like the SDK's real service: the vendor's host name
+    (for example `storage.googleapis.com`) is mapped to this machine, Caddy answers with its own
+    certificate, rewrites the vendor's path onto the n8n webhook, and forwards to n8n. That is how an
+    SDK with a hard-coded host gets a **high-fidelity mock**. n8n stays directly reachable on
+    `http://localhost:5678` for everything else.
+  - **Recognize it:** the user mentions Caddy, a proxy, hosts entries, certificates, or an SDK has no
+    endpoint setting or insists on a fixed host or HTTPS. Read `caddy-proxy.md`: how to add a host to
+    the Caddyfile, validate and reload, start the container, and verify through the real host name.
+  - Ground rules: use it only when the SDK can't simply be pointed at the mock. Propose the Caddyfile
+    changes and get an OK before editing. **The user does these steps, Frank asks:** hosts-file entries
+    (admin; give the exact lines and warn that the real service is unreachable while they exist),
+    trusting Caddy's local CA (a security decision), and freeing ports 80/443. Say plainly that gRPC
+    services can't be mocked through n8n webhooks.
 - **Code indexer CLI (`codeindex`)**
   - A Roslyn-based index of a **.NET/C# solution**. Use it, instead of grep or opening files blindly, to
     answer "where is X defined", "what uses X", "who calls X", "what implements X", "what does this type
@@ -149,7 +163,8 @@ operations with the code indexer (see Tools) rather than reading file by file.
 Look for a base URL or endpoint setting, custom HTTP client or handler, or emulator host. (In a .NET SDK
 the code indexer finds the builder, endpoint, and emulator members quickly; the host strings and
 environment variable names themselves are literals you read or grep.) If there is no seam, propose
-options (proxy, DNS/hosts override, env var, test-only wrapper) and **ask before changing any code**.
+options (the Caddy proxy with hosts entries, env var, test-only wrapper; see Tools) and **ask before
+changing any code**.
 
 ### 3. Build the n8n mocks
 - Mocks are **always n8n workflows**: Webhook nodes as endpoints, n8n tables as the fake datastore when

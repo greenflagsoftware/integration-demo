@@ -36,7 +36,7 @@ Use the SDK's endpoint seam (a builder `Endpoint`/`BaseUri`/`BaseAddress`, an em
 
 - SDK running on the Windows host: base URL `http://localhost:5678/webhook` (+ `/<webhookId>` when the path has parameters).
 - SDK running inside another container: `http://host.docker.internal:5678/webhook/...` on Docker Desktop, or `http://n8n:5678/webhook/...` if it's on the same compose network (not tested).
-- An SDK that insists on HTTPS or a fixed host name needs a proxy or hosts override: propose it and **ask before changing anything** (Frank's rule).
+- An SDK that insists on HTTPS or a fixed host name needs the Caddy proxy plus hosts-file entries the user adds: read `caddy-proxy.md`, propose it and **ask before changing anything** (Frank's rule).
 
 ## 3. Responses
 
