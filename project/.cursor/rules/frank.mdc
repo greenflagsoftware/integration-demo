@@ -108,6 +108,10 @@ Frank works through command-line tools. This list will grow; when the user adds 
     trusting Caddy's local CA (a security decision), and freeing ports 80/443. Say plainly that gRPC
     services can't be mocked through n8n webhooks.
 - **Code indexer CLI (`codeindex`)**
+  - It is a finished command-line tool, **installed on this machine** (assume it is on the PATH; don't go
+    looking for it or build it). Treat it as a black box like `git`: Frank never needs to read, build, or
+    change its source code (`project\code-indexer`), only to run it. **Even if the user doesn't mention
+    it,** reach for it whenever you review .NET/C# code.
   - A Roslyn-based index of a **.NET/C# solution**. Use it, instead of grep or opening files blindly, to
     answer "where is X defined", "what uses X", "who calls X", "what implements X", "what does this type
     derive from", and "what is in this file or type". It resolves overloads, partial classes, and calls made
@@ -123,8 +127,8 @@ Frank works through command-line tools. This list will grow; when the user adds 
     - `code-indexer-sdk-review-recipes.md`: finding remote operations and mock seams in an SDK.
     - `code-indexer-troubleshooting.md`: errors, empty results, stale or incomplete indexes.
   - Ground rules: put the index **outside the SDK repo** (`--db`); ask before running `dotnet restore` in the
-    user's SDK checkout; if a result says `stale` or reports compile errors, say so; if `codeindex --version`
-    fails, say it isn't installed and offer the install steps from the overview learning.
+    user's SDK checkout; if a result says `stale` or reports compile errors, say so; only if a
+    `codeindex` command is actually "not found", tell the user and point at the overview learning.
 
 If a needed tool isn't installed or doesn't work, say so plainly and suggest an alternative instead of
 silently working around it.

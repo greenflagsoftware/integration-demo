@@ -1,5 +1,5 @@
 ---
-description: What the code indexer (the `codeindex` CLI) is, when to use it instead of grep or opening files for .NET/C# SDK code, how to check it is installed, where its index should live, and how to keep it fresh. Read when asked about the code indexer or codeindex, or about finding where something is defined, used, called, or implemented in .NET code.
+description: What the code indexer (the `codeindex` CLI) is, when to use it instead of grep or opening files for .NET/C# SDK code, that it is an installed CLI tool to run (never to read or build), where its index should live, and how to keep it fresh. Read when asked about the code indexer or codeindex, or about finding where something is defined, used, called, or implemented in .NET code.
 type: reference
 ---
 
@@ -30,7 +30,12 @@ gRPC), which is exactly what Frank needs to list an SDK's remote operations.
   `code-indexer-troubleshooting.md`).
 - It **finds the lines; you still read them.** Use it to know which files and lines matter, then open only those.
 
-## Check it is installed
+## It is an installed CLI tool
+
+`codeindex` is installed on this machine as a .NET global tool (version 0.1.0 when checked on 2026-10-25), so **assume it
+is there and just run it**; you don't need to check first, and you don't need to know or touch how it is built. Treat it as
+a black box, like `git`. You never read or edit its source. Use it for .NET/C# code reviews even when the user didn't
+mention it. If a command ever reports "not found", that is the one time to check:
 
 ```powershell
 codeindex --version        # prints something like 0.1.0+<commit>
@@ -46,9 +51,9 @@ dotnet pack CodeIndexer.Cli -c Release                                   # write
 dotnet tool install --global CodeIndexer.Cli --add-source .\artifacts    # update later with `dotnet tool update`
 ```
 
-Ask before installing anything globally. The tool's source, README, plan, and JSON output contract are in this repo:
+Ask before installing anything globally. (Only the user or a maintainer needs the rest of this section; the tool's source, README, plan, and JSON output contract are in this repo:
 `project\code-indexer\README.md`, `project\docs\code-indexer-development-plan.md`,
-`project\docs\code-indexer-output-contract.md`.
+`project\docs\code-indexer-output-contract.md`.)
 
 ## Where the index lives (do this, it matters)
 
